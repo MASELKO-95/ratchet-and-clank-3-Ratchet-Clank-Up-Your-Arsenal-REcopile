@@ -1,4 +1,4 @@
-# Ratchet & Clank 3 - RE:COPILE Edition
+# Ratchet & Clank: Up Your Arsenal (Ratchet & Clank 3) - RE:COPILE Edition
 
 Experimental Linux recompilation research and RE:COPILE integration by
 [MASELKO-95](https://github.com/MASELKO-95), targeting the player's own PAL

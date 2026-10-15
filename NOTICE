@@ -1,7 +1,7 @@
-Ratchet & Clank 3 - RE:COPILE Edition
+Ratchet & Clank: Up Your Arsenal (Ratchet & Clank 3) - RE:COPILE Edition
 Copyright (C) 2026 MASELKO-95 for original project work
 SPDX-License-Identifier: GPL-3.0-only
-Source: https://github.com/MASELKO-95/ratchet-recopile-edition
+Source: https://github.com/MASELKO-95/ratchet-3-recopile-edition
 
 2026-10-15 - MASELKO-95: prepared a source-only experimental Linux edition,
 added direct RE:COPILE entry points, dependency/publication checks and build
