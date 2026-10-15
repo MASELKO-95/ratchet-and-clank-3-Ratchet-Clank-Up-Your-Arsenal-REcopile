@@ -1,0 +1,220 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "gs_tables.glsl"
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=0,std430) buffer VRAM { uint ram[]; };
+layout(set=0,binding=1,std430) readonly buffer Parameters { uint params[]; };
+layout(set=0,binding=2,std430) readonly buffer Input { uint inputData[]; };
+layout(set=0,binding=3,std430) buffer Scratch { uint scratch[]; };
+layout(set=0,binding=4,std430) buffer Palette { uint clut[]; };
+layout(set=0,binding=5,rgba8) uniform writeonly image2D scanout;
+layout(push_constant) uniform Push { uint base; uint op; uint width; uint height; } pc;
+uint p(uint i) { return params[pc.base+i]; }
+float f(uint i) { return uintBitsToFloat(p(i)); }
+bool sixteen(uint format) { return (format&7u)==2u; }
+bool four(uint format) { return format==20u || format==36u || format==44u; }
+uint bpp(uint format) { return sixteen(format)?16u:format==20u?4u:format==19u?8u:(format&63u)==1u || format==49u?24u:32u; }
+// Addresses are expressed in bits, including the high-byte indexed formats.
+uint address(uint format,uint block,uint bw,uint x,uint y) {
+    uint page, bid, offset;
+    if (sixteen(format)) {
+        uint n=((y>>3u)&7u)*4u+((x>>4u)&3u);
+        uint table=format==2u?blockTable16[n]:format==10u?blockTable16S[n]:format==50u?blockTableZ16[n]:blockTableZ16S[n];
+        page=(block>>5u)+(y>>6u)*max(bw,1u)+(x>>6u);
+        bid=(block&31u)+table;
+        offset=((y>>1u)&3u)*64u+columnTable16[(y&1u)*16u+(x&15u)]*2u;
+    } else if (format==19u || format==20u) {
+        page=(block>>5u)+(y>>(format==19u?6u:7u))*max(bw>>1u,1u)+(x>>7u);
+        if (format==19u) {
+            bid=(block&31u)+blockTable8[((y>>4u)&3u)*8u+((x>>4u)&7u)];
+            offset=columnTable8[(y&15u)*16u+(x&15u)];
+        } else {
+            bid=(block&31u)+blockTable4[((y>>4u)&7u)*4u+((x>>5u)&3u)];
+            return (((page+(bid>>5u))<<14u)+(bid&31u)*512u+columnTable4[(y&15u)*32u+(x&31u)])*4u & 0x1ffffffu;
+        }
+    } else {
+        page=(block>>5u)+(y>>5u)*max(bw,1u)+(x>>6u);
+        uint tab=blockTable32[((y>>3u)&3u)*8u+((x>>3u)&7u)];
+        if (format==48u || format==49u) tab^=24u;
+        bid=(block&31u)+tab;
+        offset=columnTable32[(y&7u)*8u+(x&7u)]*4u;
+    }
+    uint bit=(((page+(bid>>5u))<<13u)+(bid&31u)*256u+offset)*8u;
+    if (format==27u || format==36u) bit+=24u;
+    if (format==44u) bit+=28u;
+    return bit & 0x1ffffffu;
+}
+uint pixelBits(uint format) { return four(format)?4u:format==19u || format==27u?8u:bpp(format); }
+uint maskFor(uint bits) { return bits==32u?0xffffffffu:(1u<<bits)-1u; }
+uint readPixel(uint fmt,uint block,uint bw,uvec2 pos) {
+    uint bit=address(fmt,block,bw,pos.x,pos.y);
+    return (ram[bit>>5u]>>(bit&31u)) & maskFor(pixelBits(fmt));
+}
+void writePixel(uint fmt,uint block,uint bw,uvec2 pos,uint value) {
+    uint bit=address(fmt,block,bw,pos.x,pos.y), shift=bit&31u;
+    uint mask=maskFor(pixelBits(fmt))<<shift, i=bit>>5u;
+    if (mask==0xffffffffu) { ram[i]=value; return; }
+    // Several PSM16/8/4 pixels share a word. Keep adjacent invocations' writes.
+    uint old=atomicAdd(ram[i],0u), seen;
+    do { seen=old; old=atomicCompSwap(ram[i],seen,(seen&~mask)|((value<<shift)&mask)); } while(old!=seen);
+}
+ivec4 unpackColor(uint v) { return ivec4(v&255u,(v>>8u)&255u,(v>>16u)&255u,v>>24u); }
+uint packColor(ivec4 c) { uvec4 u=uvec4(c)&255u;return u.x|(u.y<<8u)|(u.z<<16u)|(u.w<<24u); }
+uint expand16(uint c) { return ((c&31u)<<3u)|((c&992u)<<6u)|((c&31744u)<<9u)|((c&32768u)<<16u); }
+uint reduce16(uint c) { return ((c>>3u)&31u)|((c>>6u)&992u)|((c>>9u)&31744u)|((c>>16u)&32768u); }
+uint texa(uint c,uint fmt) {
+    if(fmt==0u || fmt==48u) return c;
+    if(sixteen(fmt)) c=expand16(c);
+    uint a=(sixteen(fmt) && (c&0x80000000u)!=0u)?p(34):p(32);
+    if ((fmt&7u)==1u || sixteen(fmt)) {
+        if((c&0xffffffu)==0u && p(33)!=0u && (c&0x80000000u)==0u) a=0u;
+        c=(c&0xffffffu)|(a<<24u);
+    }
+    return c;
+}
+int wrapCoord(int v,int dim,uint mode,uint mn,uint mx) {
+    if(mode==0u) return v&(dim-1);
+    if(mode==1u) return clamp(v,0,dim-1);
+    if(mode==2u) return clamp(v,int(mn),int(mx));
+    return (v&int(mn))|int(mx);
+}
+uint samplePoint(ivec2 uv) {
+    uv.x=wrapCoord(uv.x,int(p(29)),p(35)&3u,(p(35)>>4u)&1023u,(p(35)>>14u)&1023u);
+    uv.y=wrapCoord(uv.y,int(p(30)),(p(35)>>2u)&3u,(p(35)>>24u)|((p(36)&63u)<<8u),(p(36)>>2u)&1023u);
+    uint fmt=p(22), c=readPixel(fmt,p(20),p(21),uvec2(uv));
+    if(fmt==19u || fmt==20u || fmt==27u || fmt==36u || fmt==44u) {
+        uint index=four(fmt)?c&15u:c;
+        uint cb=(p(27)&(sixteen(p(25))?31u:15u))*16u;
+        uint ci=(cb+index)&(sixteen(p(25))?511u:255u);
+        if (!sixteen(p(25)) && p(26)==0u && !four(fmt)) ci=min((index&240u)+cb,240u)+(index&15u);
+        c=clut[ci]; if(!sixteen(p(25))) c|=clut[ci+256u]<<16u;
+        return texa(c,p(25));
+    }
+    return texa(c,fmt);
+}
+ivec4 sampleTexture(vec2 uv) {
+    if(p(31)==0u) return unpackColor(samplePoint(ivec2(uv)));
+    vec2 a=uv-0.5, fraction=fract(a); ivec2 q=ivec2(floor(a));
+    vec4 top=mix(vec4(unpackColor(samplePoint(q))),vec4(unpackColor(samplePoint(q+ivec2(1,0)))),fraction.x);
+    vec4 bottom=mix(vec4(unpackColor(samplePoint(q+ivec2(0,1)))),vec4(unpackColor(samplePoint(q+ivec2(1,1)))),fraction.x);
+    return ivec4(floor(mix(top,bottom,fraction.y)+0.5));
+}
+bool alphaPass(int a) {
+    uint test=p(12),method=(test>>1u)&7u;int ref=int((test>>4u)&255u);
+    if((test&1u)==0u) return true;
+    return method==0u?false:method==1u?true:method==2u?a<ref:method==3u?a<=ref:method==4u?a==ref:method==5u?a>=ref:method==6u?a>ref:a!=ref;
+}
+ivec3 selectRgb(uint sel,ivec3 src,ivec3 dst) { return sel==0u?src:sel==1u?dst:ivec3(0); }
+void storeFragment(uvec2 pos,uint z,ivec4 c,int fog) {
+    uint test=p(12),fmt=p(6), fail=(test>>12u)&3u;
+    bool pass=alphaPass(c.w),rgb=pass || fail==1u || fail==3u,za=pass || fail==2u,al=rgb && (pass || fail!=3u || fmt!=0u);
+    if(!rgb && !za) return;
+    if(p(17)==2u && (pos.y&1u)==0u || p(17)==3u && (pos.y&1u)!=0u) return;
+    if((p(0)&16u)!=0u) c.rgb=(c.rgb*fog+unpackColor(p(18)).rgb*(255-fog))>>8;
+    uint raw=readPixel(fmt,p(4),p(5),pos), dest=raw;
+    if(sixteen(fmt)) dest=expand16(raw);
+    if(fmt==1u) dest|=0x80000000u;
+    if((test&16384u)!=0u && fmt!=1u && ((raw>>(sixteen(fmt)?15u:31u))&1u)!=((test>>15u)&1u)) return;
+    uint method=(test>>17u)&3u,stored=readPixel(p(9),p(8),p(5),pos);
+    if((test&65536u)!=0u && (method==0u || method==2u && z<stored || method==3u && z<=stored)) return;
+    if(rgb) {
+        ivec4 d=unpackColor(dest);
+        if((p(0)&8u)!=0u && !(p(16)!=0u && c.w<128)) {
+            uint ar=p(13), sel=(ar>>4u)&3u;
+            int a=sel==0u?c.w:sel==1u?d.w:int(p(14));
+            c.rgb=((selectRgb(ar&3u,c.rgb,d.rgb)-selectRgb((ar>>2u)&3u,c.rgb,d.rgb))*a>>7)+selectRgb((ar>>6u)&3u,c.rgb,d.rgb);
+        }
+        c.rgb=p(19)!=0u?clamp(c.rgb,ivec3(0),ivec3(255)):c.rgb&255;
+        if(p(15)!=0u && al && fmt!=1u) c.w|=128;
+        uint outColor=packColor(c);if(!al) outColor=(outColor&0xffffffu)|(dest&0xff000000u);
+        if(sixteen(fmt)) outColor=reduce16(outColor);
+        outColor=(outColor&~p(7))|(raw&p(7));
+        writePixel(fmt,p(4),p(5),pos,outColor);
+    }
+    if(za && p(10)==0u) writePixel(p(9),p(8),p(5),pos,z);
+}
+vec2 xy(uint i) { return vec2(f(64u+i*16u),f(65u+i*16u)); }
+vec2 uv(uint i) {
+    uint k=64u+i*16u;
+    if((p(0)&4u)!=0u) return vec2(p(k+8u),p(k+9u))/16.0;
+    float q=f(k+5u); if(abs(q)<1e-8) q=1.0;
+    return vec2(f(k+6u),f(k+7u))/q*vec2(p(29),p(30));
+}
+ivec4 color(uint i) { return unpackColor(p(67u+i*16u)); }
+void draw(uvec2 id) {
+    ivec2 pos=ivec2(id)+ivec2(p(40),p(41));
+    vec2 a=xy(0u),b=xy(1u),c=xy(2u),q=vec2(pos)+0.5;
+    vec3 w=vec3(0,0,1); uint last=2u;uint type=p(1);
+    if(type==6u) { w=vec3(1,0,0);last=1u; }
+    else if(type==0u) { w=vec3(1,0,0);last=0u; }
+    else if(type==1u || type==2u) {
+        vec2 ab=b-a;float len2=dot(ab,ab),t=len2==0.0?0.0:clamp(dot(q-a,ab)/len2,0.0,1.0);
+        if(length(q-(a+t*ab))>0.71) return;w=vec3(1.0-t,t,0);last=1u;
+    } else {
+        float denom=(b.y-c.y)*(a.x-c.x)+(c.x-b.x)*(a.y-c.y);if(abs(denom)<0.001) return;
+        w.x=((b.y-c.y)*(q.x-c.x)+(c.x-b.x)*(q.y-c.y))/denom;
+        w.y=((c.y-a.y)*(q.x-c.x)+(a.x-c.x)*(q.y-c.y))/denom;w.z=1.0-w.x-w.y;
+        if(any(lessThan(w,vec3(-1e-4)))) return;
+    }
+    ivec4 shade=(p(0)&2u)!=0u && type!=6u?ivec4(vec4(color(0u))*w.x+vec4(color(1u))*w.y+vec4(color(2u))*w.z):color(last);
+    uint z=type==6u?p(82):uint(float(p(66))*w.x+float(p(82))*w.y+float(p(98))*w.z);
+    if((p(0)&1u)!=0u) {
+        vec2 coord;
+        if(type==6u) coord=mix(uv(0u),uv(1u),(q-min(a,b))/max(abs(b-a),vec2(1)));
+        else if((p(0)&4u)!=0u) coord=uv(0u)*w.x+uv(1u)*w.y+uv(2u)*w.z;
+        else {
+            vec3 stq=vec3(f(70),f(71),f(69))*w.x+vec3(f(86),f(87),f(85))*w.y+vec3(f(102),f(103),f(101))*w.z;
+            coord=stq.xy/(abs(stq.z)<1e-8?1.0:stq.z)*vec2(p(29),p(30));
+        }
+        if((p(0)&4u)!=0u) coord=clamp(floor(coord*16.0+(type==6u?0.5:0.0)),vec2(0),vec2(65535))/16.0;
+        ivec4 t=sampleTexture(coord);uint mode=p(23);int alpha=shade.w;
+        if(mode==0u) { shade.rgb=(t.rgb*shade.rgb)>>7; if(p(24)!=0u) shade.w=(t.w*shade.w)>>7; }
+        else if(mode==1u) { shade.rgb=t.rgb;if(p(24)!=0u) shade.w=t.w; }
+        else { shade.rgb=((t.rgb*shade.rgb)>>7)+alpha;if(p(24)!=0u) shade.w=mode==2u?t.w+alpha:t.w; }
+        shade=clamp(shade,ivec4(0),ivec4(255));
+    }
+    int fog=type==6u?int(p(90)):int(float(p(74))*w.x+float(p(90))*w.y+float(p(106))*w.z);
+    storeFragment(uvec2(pos),z,shade,fog);
+}
+void main() {
+    uvec2 id=gl_GlobalInvocationID.xy;if(id.x>=pc.width || id.y>=pc.height) return;
+    uint index=id.y*pc.width+id.x;
+    if(pc.op==0u) { draw(id);return; }
+    if(pc.op==1u) {
+        uint n=p(6)+index,bits=pixelBits(p(0)),bit=index*bits+p(7),word=inputData[p(8)+(bit>>5u)];
+        uint v=word>>(bit&31u);if((bit&31u)+bits>32u) v|=inputData[p(8)+(bit>>5u)+1u]<<(32u-(bit&31u));
+        writePixel(p(0),p(1),p(2),uvec2(p(3)+n%p(5),p(4)+n/p(5)),v);return;
+    }
+    if(pc.op==2u) {
+        uint count=four(p(0))?16u:256u;if(index>=count) return;
+        bool s=sixteen(p(3)),suffix=p(4)==0u && !s && count==256u;uint cb=(p(5)&(s?31u:15u))*16u;
+        if(suffix && index<cb) return;
+        uint src=(index&~24u)|((index&8u)<<1u)|((index&16u)>>1u);
+        uvec2 pos=p(4)==0u?uvec2(src&15u,src>>4u):uvec2(p(7)*16u+index,p(8));
+        uint v=readPixel(p(3),p(1),p(4)==0u?1u:p(6),pos),dest=(suffix?index:cb+index)&(s?511u:255u);
+        clut[dest]=v&65535u;if(!s) clut[dest+256u]=v>>16u;return;
+    }
+    if(pc.op==3u || pc.op==4u) {
+        uvec2 pos=id+uvec2(p(3),p(4));
+        if(pc.op==3u) scratch[index]=readPixel(p(0),p(1),p(2),pos);
+        else writePixel(p(0),p(1),p(2),pos,scratch[index]);return;
+    }
+    if(pc.op==6u) {
+        uvec2 pos=id+uvec2(p(3),p(4));uint c=p(5);
+        if(p(6)!=0u) c=(c&~p(6))|(readPixel(p(0),p(1),p(2),pos)&p(6));
+        writePixel(p(0),p(1),p(2),pos,c);return;
+    }
+    if(pc.op==5u) {
+        uint y=id.y;bool bob=p(6)!=0u;uint parity=p(7);
+        uint y0=y,y1=y;float t=0.0;
+        if(bob && (y&1u)!=parity) {
+            y0=y==0u?parity:y-1u;y1=min(y+1u,pc.height-1u);
+            if((y1&1u)!=parity) y1=y0;t=0.5;
+        }
+        uint a=readPixel(p(0),p(1),p(2),uvec2(id.x+p(3),y0+p(4))),b=readPixel(p(0),p(1),p(2),uvec2(id.x+p(3),y1+p(4)));
+        if(sixteen(p(0))) {a=expand16(a);b=expand16(b);}
+        vec3 rgb=mix(vec3(unpackColor(a).rgb),vec3(unpackColor(b).rgb),t)/255.0;
+        if(any(greaterThan(rgb,vec3(0)))) atomicAdd(scratch[1048575],1u);
+        imageStore(scanout,ivec2(id),vec4(rgb,1));
+    }
+}

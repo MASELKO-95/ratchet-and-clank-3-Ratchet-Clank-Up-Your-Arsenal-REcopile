@@ -1,0 +1,2411 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_subsystem.h b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+index 68fec81..9cf5092 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_subsystem.h
++++ b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+@@ -24,7 +24,7 @@ namespace ps2x::iop
+         void reset();
+ 
+         [[nodiscard]] ModuleLoadResult loadModule(std::string_view path, const void *arguments = nullptr, uint32_t argumentSize = 0);
+-        [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
++        [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0, bool sourceIsIop = false);
+         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result = nullptr);
+         void runEeCycles(uint64_t eeCycles) noexcept;
+ 
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index 4977102..b738d89 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -67,6 +67,7 @@ namespace ps2x::iop::detail
+         void terminateThreadsInRange(uint32_t base, uint32_t size);
+ 
+         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
++        [[nodiscard]] const std::map<int, IopThread> &threads() const noexcept { return m_threads; }
+ 
+     private:
+         struct Semaphore
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index e5f63a9..9bf951c 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -37,6 +37,7 @@ namespace ps2x::iop::detail
+         constexpr uint32_t kCallStackSize = 0x2000u;
+         constexpr uint32_t kCallStackCapacity = (kCallStackLimit - kCallStackBase) / kCallStackSize;
+         constexpr uint64_t kCdvdCompletionCycles = 128u;
++        constexpr uint64_t kSifDmaCompletionCycles = 128u;
+ 
+         uint32_t physicalAddress(uint32_t address)
+         {
+@@ -78,6 +79,7 @@ namespace ps2x::iop::detail
+             uint32_t entry = 0;
+             uint32_t gp = 0;
+             bool resident = false;
++            bool started = false;
+         };
+ 
+         struct GuestCallback
+@@ -136,6 +138,7 @@ namespace ps2x::iop::detail
+             servicingDmaInterrupts = false;
+             servicingGuestCallbacks = false;
+             callDepth = 0u;
++            cdvdDiagnostics = 0u;
+             secrMcCommandHandler = {};
+             secrMcDevIdHandler = {};
+             checkKelfPathCallback = {};
+@@ -250,6 +253,15 @@ namespace ps2x::iop::detail
+ 
+             if (iequals(call.library, "cdvdman") && cdvd.dispatchImport(call.ordinal, cpu))
+             {
++                if (cdvdDiagnostics < 32u && (call.ordinal == 6u || call.ordinal == 37u))
++                {
++                    ++cdvdDiagnostics;
++                    std::ostringstream message;
++                    message << "[IOP] cdvdman:" << call.ordinal << " a0=0x" << std::hex << a0
++                            << " a1=0x" << cpu.gpr[5] << " a2=0x" << cpu.gpr[6]
++                            << " result=0x" << cpu.gpr[2] << " ra=0x" << cpu.gpr[31];
++                    log(LogLevel::Info, message.str());
++                }
+                 if (const auto callback = cdvd.takeCompletionCallback())
+                 {
+                     pendingGuestCallbacks.emplace(
+@@ -308,7 +320,20 @@ namespace ps2x::iop::detail
+                     break;
+                 }
+             }
+-            if (iequals(call.library, "modload") && call.ordinal == 13u)
++            if (iequals(call.library, "modload") && call.ordinal == 16u) { uint32_t a1 = cpu.gpr[5], a2 = cpu.gpr[6]; int32_t limit = static_cast<int32_t>(a1); uint32_t addr = IopMemory::physicalAddress(a0), total = IopMemory::physicalAddress(a2); if (limit < 0 || (limit > 0 && (a0 == 0 || (a0 & 3u) != 0 || addr >= IopMemory::RamSize || uint32_t(limit) > (IopMemory::RamSize - addr) / 4u)) || (a2 != 0 && ((a2 & 3u) != 0 || total > IopMemory::RamSize - 4u))) { setV0(uint32_t(-1)); return ImportDisposition::Handled; } int32_t written = 0; for (const auto &entry : modules) { if (written >= limit) break; memory.write32(addr + uint32_t(written) * 4u, uint32_t(entry.first)); ++written; } if (a2 != 0) memory.write32(total, uint32_t(modules.size())); setV0(uint32_t(written)); return ImportDisposition::Handled; }
++            if (iequals(call.library, "modload") && call.ordinal == 10u)
++            {
++                const auto result = loadModuleBuffer(a0, nullptr, 0u, true, false);
++                setV0(static_cast<uint32_t>(result.moduleId));
++                return ImportDisposition::Handled;
++            }
++            if (iequals(call.library, "modload") && call.ordinal == 8u)
++            {
++                const int32_t result = startModuleGuest(cpu);
++                setV0(static_cast<uint32_t>(result));
++                return ImportDisposition::Handled;
++            }
++if (iequals(call.library, "modload") && call.ordinal == 13u)
+             {
+                 checkKelfPathCallback = {a0, cpu.gpr[28]};
+                 setV0(0);
+@@ -318,9 +343,13 @@ namespace ps2x::iop::detail
+                 return ImportDisposition::Handled;
+             if (iequals(call.library, "sifman"))
+             {
+-                return rpc.dispatchSifManImport(call.ordinal, cpu)
+-                           ? ImportDisposition::Handled
+-                           : ImportDisposition::Missing;
++                if (rpc.dispatchSifManImport(call.ordinal, cpu))
++                {
++                    if (const auto callback = rpc.takeDmaCompletionCallback())
++                        pendingGuestCallbacks.emplace(totalCycles + kSifDmaCompletionCycles,
++                            ScheduledGuestCallback{callback->function, callback->gp, callback->argument});
++                    return ImportDisposition::Handled;
++                }
+             }
+             if (iequals(call.library, "vblank") && vblank.dispatchImport(call.ordinal, cpu, totalCycles))
+                 return ImportDisposition::Handled;
+@@ -456,6 +485,15 @@ namespace ps2x::iop::detail
+             }
+             cpu.gpr[31] = kCallReturnSentinel;
+             runCpu(cpu, budget);
++            if (!cpu.stopped && !cpu.yielded)
++            {
++                std::ostringstream out;
++                out << "[IOP] call budget exhausted entry=0x" << std::hex << address
++                    << " pc=0x" << cpu.pc << " ra=0x" << cpu.gpr[31]
++                    << " cause=0x" << cpu.cop0[13] << " epc=0x" << cpu.cop0[14];
++                log(LogLevel::Error, out.str());
++                return 0xFFFFFFFFu;
++            }
+             return cpu.gpr[2];
+         }
+ 
+@@ -588,7 +626,7 @@ namespace ps2x::iop::detail
+             }
+         }
+ 
+-        ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
++        ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize, bool startNow = true)
+         {
+             ModuleLoadResult result{true, -1, -1};
+             const IopImageLoadResult loaded = IopModuleLoader::load(image, memory, moduleCursor);
+@@ -614,33 +652,76 @@ namespace ps2x::iop::detail
+             module.entry = loaded.entry;
+             module.gp = loaded.gp;
+ 
+-            uint32_t args = 0u;
+-            if (arguments && argumentSize)
++            result.moduleId = module.id;
++            modules.emplace(module.id, module);
++            result.startResult = 0;
++            if (startNow)
+             {
+-                args = allocate(argumentSize + 1u, 16u);
+-                if (args)
+-                {
+-                    writeRam(args, arguments, argumentSize);
+-                    write8(args + argumentSize, 0u);
+-                }
++                const std::string entryName = module.path.starts_with("buffer@") ? "LBbyEE" : module.path;
++                result.startResult = startLoadedModule(module.id, entryName, arguments, argumentSize);
+             }
+-            const uint32_t startResult = callFunction(module.entry, argumentSize, args, 0u, 0u, module.gp);
+-            if (args)
+-                freeAllocation(args);
+-            module.resident = startResult == 0u || startResult == 2u;
+-            result.moduleId = module.id;
+-            result.startResult = static_cast<int32_t>(startResult);
+-            modules[module.id] = std::move(module);
+-
+             std::ostringstream out;
+             out << "[IOP] loaded IRX id=" << result.moduleId
+-                << " entry=0x" << std::hex << modules[result.moduleId].entry
+-                << " base=0x" << modules[result.moduleId].base
+-                << " start=" << std::dec << result.startResult;
++                << " entry=0x" << std::hex << module.entry
++                << " base=0x" << module.base << " start=" << std::dec << result.startResult
++                << " deferred=" << !startNow;
+             log(LogLevel::Info, out.str());
+             return result;
+         }
+ 
++        int32_t startLoadedModule(int32_t moduleId, std::string_view entryName, const void *arguments, uint32_t argumentSize)
++        {
++            auto moduleIt = modules.find(moduleId);
++            if (moduleIt == modules.end() || moduleIt->second.started || argumentSize > kRamSize ||
++                (argumentSize && !arguments) || entryName.size() > 1024u)
++                return -1;
++            const uint32_t entry = moduleIt->second.entry, gp = moduleIt->second.gp;
++
++            // IRX entry uses argc/argv. SIF supplies a block of NUL-terminated
++            // strings, not a byte count and a pointer directly to that block.
++            std::vector<uint32_t> offsets;
++            const auto *argumentBytes = static_cast<const uint8_t *>(arguments);
++            if (argumentBytes)
++                for (uint32_t offset = 0; offset < argumentSize;)
++                {
++                    offsets.push_back(offset);
++                    while (offset < argumentSize && argumentBytes[offset] != 0u)
++                        ++offset;
++                    if (offset < argumentSize)
++                        ++offset;
++                }
++            // LOADFILE uses this literal pathname when starting an IRX from
++            // an IOP buffer (see PS2SDK loadfile_loadmodulebuffer).
++            const uint32_t argc = static_cast<uint32_t>(offsets.size()) + 1u;
++            const uint64_t tableSize = (static_cast<uint64_t>(argc) + 1u) * 4u;
++            const uint64_t allocationSize = tableSize + entryName.size() + 1u
++                                            + (argumentBytes ? argumentSize : 0u) + 1u;
++            if (allocationSize > kRamSize)
++                return -1;
++            const uint32_t args = allocate(static_cast<uint32_t>(allocationSize), 16u);
++            if (!args)
++                return -1;
++            const uint32_t pathAddress = args + static_cast<uint32_t>(tableSize);
++            const uint32_t stringsAddress = pathAddress + static_cast<uint32_t>(entryName.size()) + 1u;
++            writeRam(pathAddress, entryName.data(), entryName.size());
++            write8(pathAddress + static_cast<uint32_t>(entryName.size()), 0u);
++            write32(args, pathAddress);
++            if (argumentBytes && argumentSize)
++                writeRam(stringsAddress, argumentBytes, argumentSize);
++            write8(stringsAddress + (argumentBytes ? argumentSize : 0u), 0u);
++            for (uint32_t i = 0; i < offsets.size(); ++i)
++                write32(args + (i + 1u) * 4u, stringsAddress + offsets[i]);
++            write32(args + argc * 4u, 0u);
++            moduleIt->second.started = true;
++            const uint32_t startResult = callFunction(entry, argc, args, 0u, 0u, gp);
++            if (args)
++                freeAllocation(args);
++            moduleIt = modules.find(moduleId);
++            if (moduleIt != modules.end())
++                moduleIt->second.resident = (startResult & 3u) == 0u || (startResult & 3u) == 2u;
++            return static_cast<int32_t>(startResult);
++        }
++
+         ModuleLoadResult loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
+         {
+             std::vector<uint8_t> image;
+@@ -652,14 +733,51 @@ namespace ps2x::iop::detail
+             return loadImage(std::string(path), image, arguments, argumentSize);
+         }
+ 
+-        ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
++        ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize, bool sourceIsIop, bool startNow = true)
+         {
+             std::vector<uint8_t> image;
+-            if (!IopModuleLoader::readElfFromGuest(host, guestAddress, image))
++            if (!IopModuleLoader::readElfFromGuest(host, guestAddress, image, sourceIsIop ? &memory : nullptr))
+                 return {true, -1, -1};
+             std::ostringstream tag;
+             tag << "buffer@0x" << std::hex << guestAddress;
+-            return loadImage(tag.str(), image, arguments, argumentSize);
++            return loadImage(tag.str(), image, arguments, argumentSize, startNow);
++        }
++
++        int32_t startModuleGuest(const CpuState &cpu)
++        {
++            const int32_t id = static_cast<int32_t>(cpu.gpr[4]);
++            const uint32_t name = cpu.gpr[5], count = cpu.gpr[6], data = cpu.gpr[7];
++            const uint32_t stack = physicalAddress(cpu.gpr[29]);
++            if ((stack & 3u) || stack > kRamSize - 20u || static_cast<int32_t>(count) < 0 || count > kRamSize)
++                return -1;
++            const uint32_t output = memory.read32(stack + 16u), outputPhys = physicalAddress(output);
++            if (output && ((output & 3u) || outputPhys > kRamSize - 4u))
++                return -1;
++            std::string pathname;
++            if (!name)
++                return -1;
++            const uint32_t namePhys = physicalAddress(name);
++            for (uint32_t i = 0; i <= 1024u; ++i)
++            {
++                if (namePhys >= kRamSize || i >= kRamSize - namePhys)
++                    return -1;
++                const char ch = static_cast<char>(memory.read8(namePhys + i));
++                if (!ch)
++                    break;
++                if (i == 1024u)
++                    return -1;
++                pathname.push_back(ch);
++            }
++            const uint32_t dataPhys = physicalAddress(data);
++            if (count && (!data || dataPhys >= kRamSize || count > kRamSize - dataPhys))
++                return -1;
++            std::vector<uint8_t> arguments(count);
++            if (count && !memory.readRam(dataPhys, arguments.data(), count))
++                return -1;
++            const int32_t start = startLoadedModule(id, pathname, arguments.data(), count);
++            if (output)
++                memory.write32(outputPhys, static_cast<uint32_t>(start));
++            return start < 0 ? -1 : id;
+         }
+ 
+         bool stopModule(int32_t moduleId, int32_t *result)
+@@ -704,6 +822,7 @@ namespace ps2x::iop::detail
+         uint64_t eeCycleCarry = 0;
+         CpuState *activeCpu = nullptr;
+         std::string lastError;
++        uint32_t cdvdDiagnostics = 0u;
+         bool servicingDmaInterrupts = false;
+         bool servicingGuestCallbacks = false;
+         uint32_t callDepth = 0u;
+@@ -729,9 +848,9 @@ namespace ps2x::iop::detail
+         return m_impl->loadModule(path, arguments, argumentSize);
+     }
+ 
+-    ModuleLoadResult IopEmulator::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
++    ModuleLoadResult IopEmulator::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize, bool sourceIsIop)
+     {
+-        return m_impl->loadModuleBuffer(guestAddress, arguments, argumentSize);
++        return m_impl->loadModuleBuffer(guestAddress, arguments, argumentSize, sourceIsIop);
+     }
+ 
+     bool IopEmulator::stopModule(int32_t moduleId, int32_t *result)
+@@ -827,4 +946,20 @@ namespace ps2x::iop::detail
+         return static_cast<uint32_t>(m_impl->rpc.serverCount());
+     }
+ 
++    std::vector<std::string> IopEmulator::threadDiagnostics() const
++    {
++        std::vector<std::string> result;
++        for (const auto &[id, thread] : m_impl->kernel.threads())
++        {
++            std::ostringstream message;
++            message << "thread=" << id << " state=" << static_cast<unsigned>(thread.state)
++                    << " priority=" << thread.priority << " wait=" << thread.waitId
++                    << " pc=0x" << std::hex << thread.cpu.pc << " ra=0x" << thread.cpu.gpr[31]
++                    << " entry=0x" << thread.entry << " sp=0x" << thread.cpu.gpr[29]
++                    << " cause=0x" << thread.cpu.cop0[13] << " epc=0x" << thread.cpu.cop0[14];
++            result.push_back(message.str());
++        }
++        return result;
++    }
++
+ }
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+index 01b48df..eaf09a1 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -22,7 +22,7 @@ namespace ps2x::iop::detail
+ 
+         void reset();
+         [[nodiscard]] ModuleLoadResult loadModule(std::string_view path, const void *arguments, uint32_t argumentSize);
+-        [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize);
++        [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize, bool sourceIsIop = false);
+         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result);
+         void runEeCycles(uint64_t eeCycles) noexcept;
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
+@@ -41,6 +41,7 @@ namespace ps2x::iop::detail
+         [[nodiscard]] uint32_t loadedModuleCount() const noexcept;
+         [[nodiscard]] uint32_t threadCount() const noexcept;
+         [[nodiscard]] uint32_t rpcServerCount() const noexcept;
++        [[nodiscard]] std::vector<std::string> threadDiagnostics() const;
+ 
+     private:
+         class Impl;
+diff --git a/ps2xIOP/src/emulator/services/iop_module_loader.cpp b/ps2xIOP/src/emulator/services/iop_module_loader.cpp
+index 80e59d6..cf9dfa5 100644
+--- a/ps2xIOP/src/emulator/services/iop_module_loader.cpp
++++ b/ps2xIOP/src/emulator/services/iop_module_loader.cpp
+@@ -320,10 +320,14 @@ namespace ps2x::iop::detail
+         return ok;
+     }
+ 
+-    bool IopModuleLoader::readElfFromGuest(IopHost &host, uint32_t guestAddress, std::vector<uint8_t> &bytes)
++    bool IopModuleLoader::readElfFromGuest(IopHost &host, uint32_t guestAddress, std::vector<uint8_t> &bytes, const IopMemory *iopMemory)
+     {
++        const auto read = [&](uint32_t address, void *destination, size_t size) {
++            return iopMemory ? iopMemory->readRam(address, destination, size)
++                             : host.readGuest(address, destination, size);
++        };
+         Elf32Ehdr header{};
+-        if (!host.readGuest(guestAddress, &header, sizeof(header)) || !validElfHeader(header))
++        if (!read(guestAddress, &header, sizeof(header)) || !validElfHeader(header))
+             return false;
+ 
+         uint64_t required = sizeof(header);
+@@ -334,7 +338,7 @@ namespace ps2x::iop::detail
+             return false; // Should we log an error here? TODO check later
+ 
+         bytes.resize(static_cast<size_t>(required));
+-        if (!host.readGuest(guestAddress, bytes.data(), bytes.size()))
++        if (!read(guestAddress, bytes.data(), bytes.size()))
+             return false;
+ 
+         if (header.shnum != 0u && header.shentsize >= sizeof(Elf32Shdr))
+@@ -364,7 +368,7 @@ namespace ps2x::iop::detail
+             return false;
+ 
+         bytes.resize(static_cast<size_t>(required));
+-        return host.readGuest(guestAddress, bytes.data(), bytes.size());
++        return read(guestAddress, bytes.data(), bytes.size());
+     }
+ 
+     IopImageLoadResult IopModuleLoader::load(std::span<const uint8_t> image, IopMemory &memory, uint32_t moduleCursor)
+diff --git a/ps2xIOP/src/emulator/services/iop_module_loader.h b/ps2xIOP/src/emulator/services/iop_module_loader.h
+index 6cd9ef6..86b87d6 100644
+--- a/ps2xIOP/src/emulator/services/iop_module_loader.h
++++ b/ps2xIOP/src/emulator/services/iop_module_loader.h
+@@ -42,7 +42,7 @@ namespace ps2x::iop::detail
+     {
+     public:
+         [[nodiscard]] static bool readWholeHostFile(IopHost &host, std::string_view guestPath, std::vector<uint8_t> &bytes);
+-        [[nodiscard]] static bool readElfFromGuest(IopHost &host, uint32_t guestAddress, std::vector<uint8_t> &bytes);
++        [[nodiscard]] static bool readElfFromGuest(IopHost &host, uint32_t guestAddress, std::vector<uint8_t> &bytes, const IopMemory *iopMemory = nullptr);
+         [[nodiscard]] static IopImageLoadResult load(std::span<const uint8_t> image, IopMemory &memory, uint32_t moduleCursor);
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index cf4fdc6..dde6df8 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -9,6 +9,7 @@
+ #include <array>
+ #include <cstring>
+ #include <limits>
++#include <sstream>
+ #include <vector>
+ 
+ namespace ps2x::iop::detail
+@@ -23,6 +24,10 @@ namespace ps2x::iop::detail
+         m_servers.clear();
+         m_nextDmaId = 1u;
+         m_sifInitialized = false;
++        m_otherDataDiagnostics = 0u;
++        m_commandDiagnostics = 0u;
++        m_rpcDiagnostics = 0u;
++        m_dmaCompletionCallback.reset();
+     }
+ 
+     bool IopRpcBridge::dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu)
+@@ -39,6 +44,7 @@ namespace ps2x::iop::detail
+             setV0(0u);
+             return true;
+         case 7: // sceSifSetDma
++        case 32: // sceSifSetDmaIntr: same transfer, followed by an IOP callback
+         {
+             constexpr uint32_t kDescriptorSize = 16u;
+             constexpr uint32_t kMaxDescriptors = 32u;
+@@ -116,6 +122,8 @@ namespace ps2x::iop::detail
+             {
+                 m_nextDmaId = 1u;
+             }
++            if (ordinal == 32u && cpu.gpr[6] != 0u)
++                m_dmaCompletionCallback = DmaCompletionCallback{cpu.gpr[6], cpu.gpr[7], cpu.gpr[28]};
+             setV0(dmaId);
+             return true;
+         }
+@@ -126,11 +134,17 @@ namespace ps2x::iop::detail
+             setV0(m_sifInitialized ? 1u : 0u);
+             return true;
+         default:
+-            setV0(0u);
+-            return true;
++            return false;
+         }
+     }
+ 
++    std::optional<IopRpcBridge::DmaCompletionCallback> IopRpcBridge::takeDmaCompletionCallback() noexcept
++    {
++        auto callback = m_dmaCompletionCallback;
++        m_dmaCompletionCallback.reset();
++        return callback;
++    }
++
+     bool IopRpcBridge::dispatchSifCmdImport(uint16_t ordinal, IopCpuState &cpu)
+     {
+         const auto setV0 = [&](uint32_t value)
+@@ -197,7 +211,15 @@ namespace ps2x::iop::detail
+             std::memcpy(packet.data() + 4u, &extraDestination, sizeof(extraDestination));
+             std::memcpy(packet.data() + 8u, &commandId, sizeof(commandId));
+ 
+-            if (!m_host.sendSifCommand(commandId, packet.data(), packetSize))
++            const bool delivered = m_host.sendSifCommand(commandId, packet.data(), packetSize);
++            if (m_commandDiagnostics++ < 16u)
++            {
++                std::ostringstream message;
++                message << "[IOP] SendCmd cid=0x" << std::hex << commandId << " size=0x" << packetSize
++                        << " extra=0x" << extraSize << " delivered=" << delivered;
++                m_host.log(LogLevel::Info, message.str());
++            }
++            if (!delivered)
+             {
+                 // A command without an EE handler is still a completed DMA on  real hardware. Only malformed packets fail above.
+             }
+@@ -244,9 +266,59 @@ namespace ps2x::iop::detail
+             m_kernel.sleepCurrent(cpu);
+             setV0(0);
+             return true;
+-        case 23:
+-            setV0(0);
++        case 23: // sceSifGetOtherData: EE source -> IOP destination
++        {
++            const uint32_t descriptor = cpu.gpr[4], source = cpu.gpr[5];
++            const uint32_t destination = cpu.gpr[6], size = cpu.gpr[7];
++            const uint32_t stack = cpu.gpr[29];
++            if (m_otherDataDiagnostics < 8u)
++            {
++                ++m_otherDataDiagnostics;
++                std::ostringstream message;
++                message << "[IOP] GetOtherData src=0x" << std::hex << source << " dest=0x" << destination
++                        << " size=0x" << size << " rd=0x" << descriptor << " sp=0x" << stack;
++                m_host.log(LogLevel::Info, message.str());
++            }
++            const auto inRam = [](uint32_t address, uint32_t bytes) {
++                const uint32_t physical = IopMemory::physicalAddress(address);
++                return physical <= IopMemory::RamSize && bytes <= IopMemory::RamSize - physical;
++            };
++            if (!descriptor || (descriptor & 3u) || !inRam(descriptor, 28u) ||
++                (stack & 3u) || !inRam(stack, 20u) ||
++                static_cast<int32_t>(size) < 0 || size > IopMemory::RamSize ||
++                (size && (!destination || !inRam(destination, size))))
++            {
++                setV0(0xffffffffu);
++                return true;
++            }
++            const uint32_t mode = m_memory.read32(stack + 16u);
++            uint32_t normalized = 0u;
++            if ((mode & ~3u) || (size && (!m_host.normalizeGuestAddress(source, normalized) ||
++                size > std::numeric_limits<uint32_t>::max() - normalized)))
++            {
++                setV0(0xffffffffu);
++                return true;
++            }
++            std::vector<uint8_t> payload(size);
++            if (size && !m_host.readGuest(source, payload.data(), payload.size()))
++            {
++                setV0(0xffffffffu);
++                return true;
++            }
++            if (size && !m_memory.writeRam(destination, payload.data(), payload.size()))
++            {
++                setV0(0xffffffffu);
++                return true;
++            }
++            // Transfers finish synchronously, including NOWAIT. A cleared packet
++            // pointer makes sceSifCheckStatRpc observe actual completion.
++            m_memory.write32(descriptor, 0u);
++            m_memory.write32(descriptor + 4u, 0u);
++            m_memory.write32(descriptor + 8u, 0xffffffffu);
++            m_memory.write32(descriptor + 12u, mode);
++            setV0(0u);
+             return true;
++        }
+         case 24: // RemoveRpc
+         {
+             const uint32_t serverData = cpu.gpr[4];
+@@ -298,6 +370,14 @@ namespace ps2x::iop::detail
+                                                                request.send.size,
+                                                                0u,
+                                                                server.gp);
++        if (m_rpcDiagnostics++ < 32u)
++        {
++            std::ostringstream message;
++            message << "[IOP] RPC sid=0x" << std::hex << request.sid << " fn=0x" << request.function
++                    << " handler=0x" << server.function << " buffer=0x" << server.buffer
++                    << " result=0x" << returnPointer;
++            m_host.log(LogLevel::Info, message.str());
++        }
+         if (returnPointer == 0u)
+             returnPointer = server.buffer;
+         if (request.receive.address != 0u && request.receive.size != 0u && returnPointer != 0u)
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.h b/ps2xIOP/src/emulator/services/iop_rpc.h
+index a4286ba..683d9bb 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.h
++++ b/ps2xIOP/src/emulator/services/iop_rpc.h
+@@ -4,6 +4,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <optional>
+ #include <unordered_map>
+ 
+ namespace ps2x::iop
+@@ -43,10 +44,17 @@ namespace ps2x::iop::detail
+     class IopRpcBridge
+     {
+     public:
++        struct DmaCompletionCallback
++        {
++            uint32_t function = 0u;
++            uint32_t argument = 0u;
++            uint32_t gp = 0u;
++        };
+         IopRpcBridge(IopHost &host, IopMemory &memory, IopKernel &kernel) noexcept;
+ 
+         void reset();
+         [[nodiscard]] bool dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu);
++        [[nodiscard]] std::optional<DmaCompletionCallback> takeDmaCompletionCallback() noexcept;
+         [[nodiscard]] bool dispatchSifCmdImport(uint16_t ordinal, IopCpuState &cpu);
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request, IopGuestExecutor &executor);
+         void onSifTransfer(const SifTransfer &transfer);
+@@ -74,5 +82,9 @@ namespace ps2x::iop::detail
+         std::unordered_map<uint32_t, RpcServer> m_servers;
+         uint32_t m_nextDmaId = 1u;
+         bool m_sifInitialized = false;
++        uint32_t m_otherDataDiagnostics = 0u;
++        uint32_t m_commandDiagnostics = 0u;
++        uint32_t m_rpcDiagnostics = 0u;
++        std::optional<DmaCompletionCallback> m_dmaCompletionCallback;
+     };
+ }
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index b498155..b80fd44 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -145,9 +145,9 @@ namespace ps2x::iop
+         return hle;
+     }
+ 
+-    ModuleLoadResult IopSubsystem::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
++    ModuleLoadResult IopSubsystem::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize, bool sourceIsIop)
+     {
+-        return m_impl->emulator.loadModuleBuffer(guestAddress, arguments, argumentSize);
++        return m_impl->emulator.loadModuleBuffer(guestAddress, arguments, argumentSize, sourceIsIop);
+     }
+ 
+     bool IopSubsystem::stopModule(int32_t moduleId, int32_t *result)
+@@ -258,6 +258,8 @@ namespace ps2x::iop
+         snapshot.emulatorThreads = m_impl->emulator.threadCount();
+         snapshot.emulatorRpcServers = m_impl->emulator.rpcServerCount();
+         snapshot.diagnostics = m_impl->loadOutcomes;
++        for (const auto &message : m_impl->emulator.threadDiagnostics())
++            snapshot.diagnostics.push_back(message);
+         if (!m_impl->lastError.empty())
+         {
+             snapshot.diagnostics.push_back(m_impl->lastError);
+diff --git a/ps2xIOP/tests/iop_emulator_tests.cpp b/ps2xIOP/tests/iop_emulator_tests.cpp
+index 44c2494..ba5b07f 100644
+--- a/ps2xIOP/tests/iop_emulator_tests.cpp
++++ b/ps2xIOP/tests/iop_emulator_tests.cpp
+@@ -561,7 +561,7 @@ namespace
+         std::memcpy(host.guest.data() + address + codeOffset, segment.data(), segment.size());
+     }
+ 
+-    void writeSifDmaIrx(TestHost &host, uint32_t address)
++    void writeSifDmaIrx(TestHost &host, uint32_t address, bool withInterrupt = false)
+     {
+         constexpr uint32_t codeOffset = 0x100u;
+         constexpr uint32_t loadAddress = 0x00010000u;
+@@ -587,6 +587,9 @@ namespace
+         const uint32_t entry[] = {
+             0x27BDFFF0u, 0xAFBF000Cu,
+             0x3C040001u, 0x34840180u, 0x24050001u,
++            0x3C060001u, 0x34C60080u, // a2 = callback
++            0x3C070001u, 0x34E701B0u, // a3 = callback argument / marker
++            0x241C5678u, // registering module GP
+             jal(setDmaStub), 0x00000000u,
+             0x00402021u, // move a0, v0
+             jal(dmaStatStub), 0x00000000u,
+@@ -595,7 +598,7 @@ namespace
+         const uint32_t imports[] = {
+             0x41E00000u, 0u, 0x00000101u,
+             0x6D666973u, 0x00006E61u, // "sifman"
+-            0x03E00008u, 0x24000007u, // sceSifSetDma
++            0x03E00008u, 0x24000000u | (withInterrupt ? 32u : 7u),
+             0x03E00008u, 0x24000008u, // sceSifDmaStat
+             0u, 0u,
+         };
+@@ -603,9 +606,17 @@ namespace
+             payloadAddress, eeDestination, sizeof(uint32_t), 0u,
+         };
+         constexpr uint32_t payload = 0x53494621u; // "SIF!"
++        const uint32_t callback[] = {
++            0xAC840000u, // sw a0, 0(a0): verify the common argument
++            0x8C880004u, 0x00000000u,
++            0x25080001u, 0xAC880004u, // increment call count
++            0xAC9C0008u, // preserve the registering GP
++            0x03E00008u, 0x00000000u,
++        };
+ 
+         std::vector<uint8_t> segment(program.filesz, 0u);
+         std::memcpy(segment.data(), entry, sizeof(entry));
++        std::memcpy(segment.data() + 0x80u, callback, sizeof(callback));
+         std::memcpy(segment.data() + 0x100u, imports, sizeof(imports));
+         std::memcpy(segment.data() + 0x180u, descriptor, sizeof(descriptor));
+         std::memcpy(segment.data() + 0x1A0u, &payload, sizeof(payload));
+@@ -891,8 +902,177 @@ namespace
+     }
+ }
+ 
++namespace {
++    // Supervisor-authored fixture: execute an actual modload16 import stub.
++    void writeModuleListIrx(TestHost &host, uint32_t list, uint32_t capacity, uint32_t total)
++    {
++        writeMinimalIrx(host, 0x100u);
++        auto *header = reinterpret_cast<ElfHeader *>(host.guest.data() + 0x100u);
++        auto *program = reinterpret_cast<ProgramHeader *>(host.guest.data() + 0x100u + sizeof(ElfHeader));
++        constexpr uint32_t base = 0x20000u;
++        header->entry = base;
++        program->vaddr = program->paddr = base;
++        program->filesz = program->memsz = 0x180u;
++        const auto lui = [](unsigned reg, uint32_t value) { return 0x3c000000u | (reg << 16u) | (value >> 16u); };
++        const auto ori = [](unsigned reg, uint32_t value) { return 0x34000000u | (reg << 21u) | (reg << 16u) | (value & 0xffffu); };
++        const uint32_t entry[] = {
++            0x27bdffe0u, 0xafbf001cu,
++            lui(4,list), ori(4,list), lui(5,capacity), ori(5,capacity), lui(6,total), ori(6,total),
++            0x0c000000u | ((base+0x114u)>>2u), 0u,
++            lui(8,0x30200u), ori(8,0x30200u), 0xad020000u,
++            0x8fbf001cu, 0x27bd0020u, 0x03e00008u, 0x00001021u,
++        };
++        const uint32_t imports[] = {
++            0x41e00000u,0u,0x00000103u,0x6c646f6du,0x0064616fu,
++            0x03e00008u,0x24000010u,0u,0u,
++        };
++        std::memset(host.guest.data()+0x200u,0,program->filesz);
++        std::memcpy(host.guest.data()+0x200u,entry,sizeof(entry));
++        std::memcpy(host.guest.data()+0x300u,imports,sizeof(imports));
++    }
++
++    bool testDeferredLoadAndStart()
++    {
++        constexpr uint32_t ram=2u*1024u*1024u, sentinel=0x55aa7788u;
++        struct Case { uint32_t name,count,data,output,stack; bool unknown; const char *label; };
++        const Case cases[] = {
++            {0x31000,4,0x31100,0x31200,0,false,"deferred load and explicit start"},
++            {0x80031000u,4,0xa0031100u,0x80031200u,0,false,"start pointer aliases"},
++            {0x31000,0,0,0,0,false,"no arguments and optional result"},
++            {0x31000,4,0x31100,0x31201,0,false,"unaligned result refused before entry"},
++            {0x31000,4,0x31100,ram,0,false,"result outside RAM"},
++            {0,4,0x31100,0x31200,0,false,"null name"},
++            {ram,4,0x31100,0x31200,0,false,"name outside RAM"},
++            {0x31000,0xffffffffu,0x31100,0x31200,0,false,"negative argument length"},
++            {0x31000,0x7fffffffu,0x31100,0x31200,0,false,"huge argument length"},
++            {0x31000,4,0,0x31200,0,false,"null argument block"},
++            {0x31000,4,ram-2,0x31200,0,false,"argument block crosses RAM"},
++            {0x31000,4,0x31100,0x31200,ram-16,false,"stack fifth argument outside RAM"},
++            {0x31000,4,0x31100,0x31200,0x32001,false,"unaligned stack"},
++            {0x31000,4,0x31100,0x31200,0,true,"unknown module ID"},
++        };
++        for(size_t index=0;index<sizeof(cases)/sizeof(cases[0]);++index) {
++            const auto &test=cases[index];
++            TestHost host(0x20000u); IopSubsystem iop(host);
++            // Child entry captures argc, pathname and argv terminator; return 6
++            // deliberately differs from its module ID (2).
++            writeMinimalIrx(host,0x100u);
++            auto *h=reinterpret_cast<ElfHeader *>(host.guest.data()+0x100u);
++            auto *ph=reinterpret_cast<ProgramHeader *>(host.guest.data()+0x100u+sizeof(ElfHeader));
++            h->entry=ph->vaddr=ph->paddr=0x40000u;
++            const uint32_t child[]={
++                0x3c080003u,0xad040000u,0x8ca90000u,0u,0x912a0000u,0u,0xad0a0004u,
++                0x00044880u,0x01254821u,0x8d290000u,0u,0xad090008u,
++                0x03e00008u,0x24020006u,
++            };
++            ph->filesz=ph->memsz=sizeof(child);
++            std::memcpy(host.guest.data()+0x200u,child,sizeof(child));
++            if(!iop.writeMemory(0x50000u,host.guest.data()+0x100u,0x100u+sizeof(child)))return false;
++            const char pathname[]="child.irx", args[]={'A',0,'B',0};
++            if(!iop.writeMemory(0x31000u,pathname,sizeof(pathname)) || !iop.writeMemory(0x31100u,args,sizeof(args)))return false;
++            for(uint32_t addr:{0x30000u,0x30004u,0x30008u,0x31200u})
++                if(!iop.writeMemory(addr,&sentinel,4))return false;
++            writeMinimalIrx(host,0x100u);
++            h=reinterpret_cast<ElfHeader *>(host.guest.data()+0x100u);
++            ph=reinterpret_cast<ProgramHeader *>(host.guest.data()+0x100u+sizeof(ElfHeader));
++            constexpr uint32_t base=0x20000u;
++            h->entry=ph->vaddr=ph->paddr=base;ph->filesz=ph->memsz=0x180u;
++            std::vector<uint32_t> code{0x27bdffe0u,0xafbf001cu,0xafb70018u};
++            auto imm=[&](unsigned r,uint32_t v){code.push_back(0x3c000000u|(r<<16u)|(v>>16u));code.push_back(0x34000000u|(r<<21u)|(r<<16u)|(v&0xffffu));};
++            imm(4,0x50000u);code.push_back(0x0c000000u|((base+0x114u)>>2u));code.push_back(0u);
++            imm(8,0x31300u);code.push_back(0xad020000u); // load ID
++            imm(9,0x30000u);code.push_back(0x8d2a0000u);code.push_back(0u);code.push_back(0xad0a0004u); // before-start marker
++            code.push_back(0x00402021u); // a0=loaded ID
++            if(test.unknown)imm(4,99u);
++            imm(5,test.name);imm(6,test.count);imm(7,test.data);
++            code.push_back(0x03a0b821u); // s7=sp
++            if(test.stack)imm(29,test.stack);
++            imm(8,test.output);if(!(test.stack&3u))code.push_back(0xafa80010u);
++            code.push_back(0x0c000000u|((base+0x11cu)>>2u));code.push_back(0u);
++            code.push_back(0x02e0e821u); // restore sp
++            imm(8,0x31300u);code.push_back(0xad020008u);
++            code.push_back(0x8fb70018u);code.push_back(0x8fbf001cu);code.push_back(0x27bd0020u);code.push_back(0x03e00008u);code.push_back(0x00001021u);
++            const uint32_t imports[]={0x41e00000u,0u,0x103u,0x6c646f6du,0x0064616fu,0x03e00008u,0x2400000au,0x03e00008u,0x24000008u,0u,0u};
++            if(!expect(code.size()*4u<=0x100u,"fixture code before imports"))return false;
++            std::memset(host.guest.data()+0x200u,0,ph->filesz);
++            std::memcpy(host.guest.data()+0x200u,code.data(),code.size()*4u);
++            std::memcpy(host.guest.data()+0x300u,imports,sizeof(imports));
++            const auto caller=iop.loadModuleBuffer(0x100u);
++            uint32_t values[3]{}, captured[3]{},output=0;
++            if(!iop.readMemory(0x31300u,values,sizeof(values)) || !iop.readMemory(0x30000u,captured,sizeof(captured)) || !iop.readMemory(0x31200u,&output,4))return false;
++            const bool success=index<3u;
++            if(!expect(caller.startResult==0 && values[0]==2u && values[1]==sentinel,"load-only must leave entry untouched")){ std::cerr<<test.label<<" start="<<caller.startResult<<" load="<<values[0]<<" before="<<values[1]<<" after="<<values[2]<<"\n"; for(const auto &log:host.logs)std::cerr<<log<<"\n"; return false; }
++            if(!expect(values[2]==(success?2u:0xffffffffu),test.label))return false;
++            if(!expect(captured[0]==(success?(test.count?3u:1u):sentinel),"argc or no entry on refusal"))return false;
++            if(!expect(captured[1]==(success?'c':sentinel) && captured[2]==(success?0u:sentinel),"pathname and argv terminator"))return false;
++            if(!expect(output==(success && test.output?6u:(test.unknown?0xffffffffu:sentinel)),"entry result output or no invalid partial write"))return false;
++        }
++        return true;
++    }
++
++    bool testModuleListImport()
++    {
++        constexpr uint32_t ram = 2u*1024u*1024u, sentinel=0x55aa7788u;
++        struct Case { uint32_t list,capacity,total; int32_t written; const char *name; };
++        const Case cases[] = {
++            {0x30000,4,0x30100,3,"actual loaded IDs including starting caller"},
++            {0x30000,1,0x30100,1,"one slot"},
++            {0,0,0x30100,0,"null list with zero slots"},
++            {0xffffffffu,0,0,0,"unused list and optional count"},
++            {0x30000,1,0,1,"optional count pointer"},
++            {0x80030000u,1,0xa0030100u,1,"RAM aliases"},
++            {ram-4,1,0x30100,1,"last RAM word"},
++            {0x30000,1,ram-4,1,"total at last RAM word"},
++            {0x30000,0xffffffffu,0x30100,-1,"negative slots"},
++            {0x30000,0x80000000u,0x30100,-1,"INT_MIN slots"},
++            {0x30000,0x40000001u,0x30100,-1,"multiply overflow"},
++            {0x30000,0x7fffffffu,0x30100,-1,"INT_MAX slots"},
++            {0,1,0x30100,-1,"null active list"},
++            {0x30001,1,0x30100,-1,"unaligned list"},
++            {ram,1,0x30100,-1,"list outside RAM"},
++            {ram-4,2,0x30100,-1,"list crossing RAM boundary"},
++            {0x30000,1,0x30101,-1,"unaligned total"},
++            {0x30000,1,ram,-1,"total outside RAM"},
++            {0x30000,1,0x80200000u,-1,"total alias outside RAM"},
++            {0,0,ram,-1,"invalid total with unused list"},
++        };
++        for(const auto &test:cases) {
++            TestHost host(0x20000u);
++            IopSubsystem iop(host);
++            writeMinimalIrx(host,0x100u);
++            const auto known=iop.loadModuleBuffer(0x100u);
++            if(!expect(known.moduleId==1 && known.startResult==7,"fixture known module"))return false;
++            writeMinimalIrx(host,0x100u);
++            auto *secondHeader=reinterpret_cast<ElfHeader *>(host.guest.data()+0x100u);
++            auto *secondProgram=reinterpret_cast<ProgramHeader *>(host.guest.data()+0x100u+sizeof(ElfHeader));
++            secondHeader->entry=secondProgram->vaddr=secondProgram->paddr=0x12000u;
++            const auto second=iop.loadModuleBuffer(0x100u);
++            if(!expect(second.moduleId==2 && second.startResult==7,"fixture second known module"))return false;
++            for(uint32_t address:{0x30000u,0x30004u,0x30100u,0x30200u,ram-4})
++                if(!iop.writeMemory(address,&sentinel,4))return false;
++            writeModuleListIrx(host,test.list,test.capacity,test.total);
++            const auto caller=iop.loadModuleBuffer(0x100u);
++            uint32_t returned=0,first=0,tail=0,total=0,last=0;
++            if(!expect(caller.moduleId>0 && caller.startResult==0,test.name))return false;
++            if(!iop.readMemory(0x30200u,&returned,4) || !iop.readMemory(0x30000u,&first,4) ||
++               !iop.readMemory(0x30004u,&tail,4) || !iop.readMemory(0x30100u,&total,4) ||
++               !iop.readMemory(ram-4,&last,4))return false;
++            if(!expect(static_cast<int32_t>(returned)==test.written,test.name))return false;
++            const bool ordinary=test.written>0 && (test.list&0x1fffffffu)==0x30000u;
++            if(!expect(first==(ordinary?1u:sentinel) && tail==(ordinary && test.written>=2?2u:sentinel),"list guards and actual IDs"))return false;
++            const bool countWritten=test.written>=0 && test.total!=0;
++            if(!expect(total==(countWritten && test.total!=ram-4?3u:sentinel),"total count or no partial write on error"))return false;
++            const uint32_t expectedLast=countWritten && test.total==ram-4?3u:(test.written==1 && test.list==ram-4?1u:sentinel);
++            if(!expect(last==expectedLast,"end RAM guard"))return false;
++        }
++        return true;
++    }
++}
++
+ int main()
+ {
++    if(!testDeferredLoadAndStart())return 1;
++    if(!testModuleListImport())return 1;
+     TestHost host(0x20000u);
+     IopSubsystem iop(host);
+ 
+@@ -911,6 +1091,57 @@ int main()
+     if (!expect(stopResult == 0, "Emulated module stop result mismatch")) return 1;
+     if (!expect(iop.debugSnapshot().emulatorLoadedModules == 0u, "Module was not released")) return 1;
+ 
++    // An actual IRX entry dereferences argv; checking only the return value of
++    // a constant-return entry would miss the SIF byte-block/argc ABI mismatch.
++    writeMinimalIrx(host, 0x100u);
++    const uint32_t argumentCode[] = {
++        0x3C080001u, // lui t0, 1 (capture at 0x10800)
++        0xAD040800u, // sw a0, 0x800(t0)
++        0x8CA90004u, // lw t1, 4(a1): argv[1]
++        0x00000000u,
++        0x912A0000u, // lbu t2, 0(t1)
++        0x00000000u,
++        0xAD0A0804u, // sw t2, 0x804(t0)
++        0x8CA90008u, // lw t1, 8(a1): argv[2]
++        0x00000000u,
++        0x912A0000u,
++        0x00000000u,
++        0xAD0A0808u,
++        0x8CA9000Cu, // lw t1, 12(a1): terminating pointer
++        0x00000000u,
++        0xAD09080Cu,
++        0x03E00008u,
++        0x00001021u, // move v0, zero
++    };
++    auto *argumentProgram = reinterpret_cast<ProgramHeader *>(host.guest.data() + 0x100u + sizeof(ElfHeader));
++    argumentProgram->filesz = argumentProgram->memsz = sizeof(argumentCode);
++    std::memcpy(host.guest.data() + 0x200u, argumentCode, sizeof(argumentCode));
++    const char moduleArguments[] = {'A', '\0', 'B', '\0'};
++    const auto argumentModule = iop.loadModuleBuffer(0x100u, moduleArguments, sizeof(moduleArguments));
++    uint32_t captured[4]{};
++    if (!expect(argumentModule.startResult == 0 && iop.readMemory(0x10800u, captured, sizeof(captured)),
++                "IRX argc/argv entry did not complete")) return 1;
++    if (!expect(captured[0] == 3u && captured[1] == 'A' && captured[2] == 'B' && captured[3] == 0u,
++                "IRX must receive pathname and two arguments with a NULL argv terminator")) return 1;
++    if (!expect(iop.stopModule(argumentModule.moduleId, nullptr), "Argument module stop failed")) return 1;
++
++    writeMinimalIrx(host, 0x100u);
++    const uint32_t endlessCode[] = {0x1000FFFFu, 0u}; // beq zero, zero, self; nop
++    std::memcpy(host.guest.data() + 0x200u, endlessCode, sizeof(endlessCode));
++    const auto endlessModule = iop.loadModuleBuffer(0x100u);
++    if (!expect(endlessModule.startResult == -1, "Exhausted IRX entry must report failure")) return 1;
++    if (!expect(iop.stopModule(endlessModule.moduleId, nullptr), "Endless module stop failed")) return 1;
++
++    writeMinimalIrx(host, 0x100u);
++    if (!expect(iop.writeMemory(0x4000u, host.guest.data() + 0x100u, 0x118u),
++                "IRX transfer to IOP memory failed")) return 1;
++    // EE contains invalid bytes at the same numeric address. A loader that
++    // silently reads EE instead of the DMA destination must fail this test.
++    const auto transferredModule = iop.loadModuleBuffer(0x4000u, nullptr, 0u, true);
++    if (!expect(transferredModule.moduleId > 0 && transferredModule.startResult == 7,
++                "Transferred IRX must be read from IOP memory")) return 1;
++    if (!expect(iop.stopModule(transferredModule.moduleId, nullptr), "Transferred module stop failed")) return 1;
++
+     constexpr uint32_t rpcSid = 0xF00DCAFEu;
+     writeRpcServerIrx(host, 0x100u);
+     const ModuleLoadResult rpcModule = iop.loadModuleBuffer(0x100u);
+@@ -1032,6 +1263,29 @@ int main()
+     if (!expect(sifDmaPayload == 0x53494621u,
+                 "IOP sceSifSetDma did not copy the payload into EE memory")) return 1;
+ 
++    iop.reset();
++    writeSifDmaIrx(host, 0x100u, true);
++    const ModuleLoadResult sifDmaInterrupt = iop.loadModuleBuffer(0x100u);
++    std::memcpy(&sifDmaPayload, host.guest.data() + sifDmaDestination, sizeof(sifDmaPayload));
++    uint32_t callbackMarker[3]{};
++    if (!expect(sifDmaInterrupt.startResult == -1 && sifDmaPayload == 0x53494621u,
++                "sceSifSetDmaIntr did not transfer data or report completion")) return 1;
++    if (!expect(iop.readMemory(0x000101B0u, callbackMarker, sizeof(callbackMarker)) && callbackMarker[1] == 0u,
++                "DMA callback ran inline inside the import")) return 1;
++    iop.runEeCycles(4096u);
++    iop.runEeCycles(4096u);
++    if (!expect(iop.readMemory(0x000101B0u, callbackMarker, sizeof(callbackMarker)) &&
++                    callbackMarker[0] == 0x000101B0u && callbackMarker[1] == 1u && callbackMarker[2] == 0x5678u,
++                "DMA completion callback did not run exactly once with its argument and GP")) return 1;
++
++    iop.reset();
++    writeSifDmaIrx(host, 0x100u, true);
++    (void)iop.loadModuleBuffer(0x100u);
++    iop.reset();
++    iop.runEeCycles(4096u);
++    if (!expect(iop.readMemory(0x000101B0u, callbackMarker, sizeof(callbackMarker)) && callbackMarker[1] == 0u,
++                "Reset retained a queued DMA callback")) return 1;
++
+     iop.reset();
+     writeVblankSchedulingIrx(host, 0x100u);
+     const ModuleLoadResult vblankModule = iop.loadModuleBuffer(0x100u);
+diff --git a/ps2xIOP/tests/iop_import_tests.cpp b/ps2xIOP/tests/iop_import_tests.cpp
+index 3035618..91c73f0 100644
+--- a/ps2xIOP/tests/iop_import_tests.cpp
++++ b/ps2xIOP/tests/iop_import_tests.cpp
+@@ -16,6 +16,7 @@
+ #include <filesystem>
+ #include <string>
+ #include <string_view>
++#include <vector>
+ 
+ namespace
+ {
+@@ -98,6 +99,114 @@ namespace
+         return false;
+     }
+ 
++    class TransferHost final : public NullHost
++    {
++    public:
++        std::vector<uint8_t> guest = std::vector<uint8_t>(1024u, 0u);
++        bool normalizeGuestAddress(uint32_t address, uint32_t &normalized) const override
++        { normalized=address; return address<=guest.size(); }
++        bool readGuest(uint32_t address, void *destination, size_t size) const override
++        {
++            if(address>guest.size() || size>guest.size()-address)return false;
++            if(size)std::memcpy(destination,guest.data()+address,size);
++            return true;
++        }
++        bool writeGuest(uint32_t address, const void *source, size_t size) override
++        {
++            if(address>guest.size() || size>guest.size()-address)return false;
++            if(size)std::memcpy(guest.data()+address,source,size);
++            return true;
++        }
++    };
++
++    bool testSifDmaCompletion()
++    {
++        struct Case { uint16_t ordinal; uint32_t source, destination, callback; bool ok; };
++        constexpr uint32_t sourceValue = 0x12345678u, sentinel = 0x55aa7788u;
++        const Case cases[] = {
++            {7u, 0x2000u, 64u, 0x3000u, true},
++            {32u, 0x2000u, 64u, 0x3000u, true},
++            {32u, 0x2000u, 64u, 0u, true},
++            {32u, IopMemory::RamSize - 2u, 64u, 0x3000u, false},
++            {32u, 0x2000u, 1022u, 0x3000u, false},
++        };
++        for (const auto &test : cases)
++        {
++            TransferHost host;
++            IopMemory memory;
++            IopKernel kernel(memory);
++            IopRpcBridge rpc(host, memory, kernel);
++            std::memcpy(host.guest.data() + 64u, &sentinel, sizeof(sentinel));
++            memory.write32(0x2000u, sourceValue);
++            memory.write32(0x1000u, test.source);
++            memory.write32(0x1004u, test.destination);
++            memory.write32(0x1008u, 4u);
++            memory.write32(0x100cu, 0u);
++            IopCpuState cpu{};
++            cpu.gpr[4] = 0x1000u;
++            cpu.gpr[5] = 1u;
++            cpu.gpr[6] = test.callback;
++            cpu.gpr[7] = 0x4567u;
++            cpu.gpr[28] = 0x89abu;
++            if (!expect(rpc.dispatchSifManImport(test.ordinal, cpu), "SIF DMA import handled") ||
++                !expect((cpu.gpr[2] != 0u) == test.ok, "SIF DMA success or rejection"))
++                return false;
++            uint32_t copied = 0u;
++            std::memcpy(&copied, host.guest.data() + 64u, sizeof(copied));
++            if (!expect(copied == (test.ok ? sourceValue : sentinel), "DMA copy or rejected transfer guard"))
++                return false;
++            const auto completion = rpc.takeDmaCompletionCallback();
++            const bool expectedCallback = test.ok && test.ordinal == 32u && test.callback != 0u;
++            if (!expect(completion.has_value() == expectedCallback, "DMA callback only for valid interrupt transfers"))
++                return false;
++            if (completion && (!expect(completion->function == test.callback, "DMA completion function") ||
++                               !expect(completion->argument == 0x4567u, "DMA completion common argument") ||
++                               !expect(completion->gp == 0x89abu, "DMA completion GP")))
++                return false;
++            if (!expect(!rpc.takeDmaCompletionCallback(), "DMA completion consumed exactly once") ||
++                !expect(!rpc.dispatchSifManImport(0xffffu, cpu), "Unknown SIF import reaches resolver"))
++                return false;
++        }
++        return true;
++    }
++
++    bool testIopGetOtherData()
++    {
++        constexpr uint32_t ram=IopMemory::RamSize, sentinel=0x55aa7788u;
++        struct Case { uint32_t descriptor,source,destination,size,stack,mode; bool ok; };
++        const Case cases[]={
++            {0x1000,32,0x2000,4,0x3000,0,true},
++            {0x80001000u,32,0xa0002000u,4,0x3000,1,true},
++            {0x1000,32,ram-4,4,0x3000,2,true},
++            {0x1000,0xffffffffu,0,0,0x3000,0,true},
++            {0,32,0x2000,4,0x3000,0,false},
++            {0x1001,32,0x2000,4,0x3000,0,false},
++            {ram-24,32,0x2000,4,0x3000,0,false},
++            {0x1000,32,0x2000,0xffffffffu,0x3000,0,false},
++            {0x1000,32,0x2000,0x7fffffffu,0x3000,0,false},
++            {0x1000,1022,0x2000,4,0x3000,0,false},
++            {0x1000,0xffffffffu,0x2000,4,0x3000,0,false},
++            {0x1000,32,ram-2,4,0x3000,0,false},
++            {0x1000,32,0,4,0x3000,0,false},
++            {0x1000,32,0x2000,4,ram-16,0,false},
++            {0x1000,32,0x2000,4,0x3001,0,false},
++            {0x1000,32,0x2000,4,0x3000,4,false},
++        };
++        for(const auto &test:cases) {
++            TransferHost host;IopMemory memory;IopKernel kernel(memory);IopRpcBridge rpc(host,memory,kernel);
++            const uint32_t value=0x12345678u;std::memcpy(host.guest.data()+32u,&value,4);
++            memory.write32(0x1000u,sentinel);memory.write32(0x2000u,sentinel);memory.write32(ram-4,sentinel);
++            memory.write32(test.stack+16u,test.mode);
++            IopCpuState cpu{};cpu.gpr[4]=test.descriptor;cpu.gpr[5]=test.source;cpu.gpr[6]=test.destination;cpu.gpr[7]=test.size;cpu.gpr[29]=test.stack;
++            if(!expect(rpc.dispatchSifCmdImport(23u,cpu) && cpu.gpr[2]==(test.ok?0u:0xffffffffu),"GetOtherData result")){std::cerr<<"desc="<<std::hex<<test.descriptor<<" src="<<test.source<<" dest="<<test.destination<<" size="<<test.size<<" sp="<<test.stack<<" result="<<cpu.gpr[2]<<"\n";return false;}
++            const uint32_t dest=IopMemory::physicalAddress(test.destination);
++            if(!expect(memory.read32(0x2000u)==(test.ok && test.size && dest==0x2000u?value:sentinel),"EE to IOP copy or no partial write"))return false;
++            if(!expect(memory.read32(ram-4)==(test.ok && test.size && dest==ram-4?value:sentinel),"end RAM transfer guard"))return false;
++            if(!expect(memory.read32(0x1000u)==(test.ok?0u:sentinel),"completion descriptor or refusal guard"))return false;
++        }
++        return true;
++    }
++
+     bool testLoadcoreRebootLibraryMode()
+     {
+         IopMemory memory;
+@@ -330,7 +439,7 @@ namespace
+ 
+ int main()
+ {
+-    if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
++    if (!testSifDmaCompletion() || !testIopGetOtherData() || !testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
+         !testTimrmanPeriodicCallback())
+         return 1;
+     std::cout << "ps2xIOP import tests passed\n";
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 4b9242c..586648a 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -290,6 +290,15 @@ public:
+     bool loadELF(const std::string &elfPath);
+     void run();
+ 
++    // A host renderer owns its window, event pump and presentation. This lets
++    // native backends run without creating a raylib/OpenGL context.
++    struct HostCallbacks {
++        std::function<void(PS2Runtime &, const char *)> initialize;
++        std::function<bool(PS2Runtime &)> frame;
++        std::function<void()> shutdown;
++    };
++    void setHostCallbacks(HostCallbacks callbacks) { m_hostCallbacks = std::move(callbacks); }
++
+     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModule(std::string_view path, const void *arguments = nullptr, uint32_t argumentSize = 0);
+     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
+     [[nodiscard]] bool stopIopModule(int32_t moduleId, int32_t *result = nullptr);
+@@ -489,6 +498,7 @@ private:
+ 
+ private:
+     PS2Memory m_memory;
++    HostCallbacks m_hostCallbacks;
+     GifArbiter m_gifArbiter;
+     GS m_gs;
+     std::unique_ptr<PS2IopHostAdapter> m_iopHost;
+diff --git a/ps2xRuntime/include/runtime/gs/gs_types.h b/ps2xRuntime/include/runtime/gs/gs_types.h
+index 836a3ff..f04cbad 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_types.h
++++ b/ps2xRuntime/include/runtime/gs/gs_types.h
+@@ -292,6 +292,7 @@ struct GSPresentationRequest
+ 
+ struct PresentationFrame
+ {
++    bool gpuPresented = false;
+     std::vector<uint8_t> pixels;
+     uint32_t width = 0;
+     uint32_t height = 0;
+@@ -301,7 +302,7 @@ struct PresentationFrame
+ 
+     explicit operator bool() const
+     {
+-        return !pixels.empty() && width != 0u && height != 0u;
++        return (gpuPresented || !pixels.empty()) && width != 0u && height != 0u;
+     }
+ };
+ 
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index ea86a9c..3aa8e9f 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -316,6 +316,8 @@ public:
+     using GifPacketCallback = std::function<void(const uint8_t *, uint32_t)>;
+     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
+     void setGifArbiter(GifArbiter *arbiter) { m_gifArbiter = arbiter; }
++    using IpuInputCallback = std::function<void(const uint8_t *, uint32_t)>;
++    void setIpuInputCallback(IpuInputCallback cb) { m_ipuInputCallback = std::move(cb); }
+ 
+     using Vu1MscalCallback = std::function<void(uint32_t startPC, uint32_t top, uint32_t itop)>;
+     void setVu1MscalCallback(Vu1MscalCallback cb) { m_vu1MscalCallback = std::move(cb); }
+@@ -398,6 +400,7 @@ public:
+     std::vector<TLBEntry> m_tlbEntries;
+ 
+     GifPacketCallback m_gifPacketCallback;
++    IpuInputCallback m_ipuInputCallback;
+     GifArbiter *m_gifArbiter = nullptr;
+     Vu1MscalCallback m_vu1MscalCallback;
+     Vu1MscntCallback m_vu1MscntCallback;
+@@ -409,6 +412,9 @@ public:
+     bool m_path3Masked = false;
+     uint32_t m_vif1PendingPath2ImageQwc = 0u;
+     bool m_vif1PendingPath2DirectHl = false;
++    uint32_t m_vif1PendingDirectBytes = 0u;
++    bool m_vif1PendingDirectHl = false;
++    std::vector<uint8_t> m_vif1PendingDirectData;
+     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
+ 
+     struct PendingTransfer
+@@ -421,6 +427,7 @@ public:
+     std::vector<PendingTransfer> m_pendingGifTransfers;
+     std::vector<PendingTransfer> m_pendingVif0Transfers;
+     std::vector<PendingTransfer> m_pendingVif1Transfers;
++    std::vector<PendingTransfer> m_pendingIpuTransfers;
+     std::mutex m_completedDmacMutex;
+     std::vector<uint32_t> m_completedDmacCauses;
+ 
+@@ -450,6 +457,7 @@ public:
+ 
+     std::array<EeTimer, 4> m_eeTimers{};
+     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
++    void processVIF1DirectPayload(const uint8_t *data, uint32_t sizeBytes, bool directHl);
+     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
+     void queueCompletedDmacCause(uint32_t cause);
+ };
+diff --git a/ps2xRuntime/include/runtime/ps2_pad.h b/ps2xRuntime/include/runtime/ps2_pad.h
+index 7755fe6..e262be6 100644
+--- a/ps2xRuntime/include/runtime/ps2_pad.h
++++ b/ps2xRuntime/include/runtime/ps2_pad.h
+@@ -3,6 +3,7 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <functional>
+ 
+ class PSPadBackend
+ {
+@@ -11,6 +12,9 @@ public:
+     ~PSPadBackend() = default;
+ 
+     bool readState(int port, int slot, uint8_t *data, size_t size);
++    void setInputProvider(std::function<bool(int, int, uint8_t *, size_t)> provider) { m_provider = std::move(provider); }
++private:
++    std::function<bool(int, int, uint8_t *, size_t)> m_provider;
+ };
+ 
+ #endif
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+index 9c54919..a3af02a 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+@@ -810,43 +810,16 @@ namespace ps2_stubs
+ 
+             if (runtime)
+             {
+-                uint32_t pktAddr = runtime->guestMalloc(128u, 16u);
+-                if (pktAddr != 0u)
+-                {
+-                    uint8_t *pkt = getMemPtr(rdram, pktAddr);
+-                    if (pkt)
+-                    {
+-                        uint64_t *q = reinterpret_cast<uint64_t *>(pkt);
+-                        q[0] = makeGiftagAplusD(7u);
+-                        q[1] = 0xEULL;
+-                        q[2] = pmode;
+-                        q[3] = 0x41ULL;
+-                        q[4] = smode2;
+-                        q[5] = 0x42ULL;
+-                        q[6] = dispfb;
+-                        q[7] = 0x59ULL;
+-                        q[8] = display;
+-                        q[9] = 0x5aULL;
+-                        q[10] = dispfb;
+-                        q[11] = 0x5bULL;
+-                        q[12] = display;
+-                        q[13] = 0x5cULL;
+-                        q[14] = bgcolor;
+-                        q[15] = 0x5fULL;
+-                        constexpr uint32_t GIF_CHANNEL = 0x1000A000;
+-                        constexpr uint32_t CHCR_STR_MODE0 = 0x101u;
+-                        auto &mem = runtime->memory();
+-                        mem.writeIORegister(GIF_CHANNEL + 0x10u, pktAddr);
+-                        mem.writeIORegister(GIF_CHANNEL + 0x20u, 8u);
+-                        mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
+-                        mem.processPendingTransfers();
+-                        runtime->guestFree(pktAddr);
+-                    }
+-                    else
+-                    {
+-                        runtime->guestFree(pktAddr);
+-                    }
+-                }
++                // CRT registers live in the privileged MMIO range, not the
++                // GIF A+D register namespace (0x42 there is ALPHA_1).
++                auto &mem = runtime->memory();
++                mem.write64(0x12000000u, pmode);
++                mem.write64(0x12000020u, smode2);
++                mem.write64(0x12000070u, dispfb);
++                mem.write64(0x12000080u, display);
++                mem.write64(0x12000090u, dispfb);
++                mem.write64(0x120000A0u, display);
++                mem.write64(0x120000E0u, bgcolor);
+             }
+         }
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index 44eaef4..d4d65f3 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -494,6 +494,7 @@ namespace ps2_stubs
+             bool sawInput = false;
+             bool sawSequenceEnd = false;
+             bool streamEnded = false;
++            bool inputEnded = false;
+             bool decoderFailed = false;
+             uint64_t cdStreamGeneration = 0u;
+             bool waitingForVideoSequenceHeader = true;
+@@ -540,6 +541,8 @@ namespace ps2_stubs
+             uint32_t getPictureWaitTraceCount = 0u;
+             uint32_t pictureTraceCount = 0u;
+             uint32_t isEndTraceCount = 0u;
++            uint32_t ipuMpegAddr = 0u;
++            std::vector<uint8_t> ipuInputTail;
+             std::unordered_map<uint32_t, std::vector<MpegRegisteredCallback>> callbacksByMpeg;
+             std::unordered_map<uint32_t, MpegPlaybackState> playbackByMpeg;
+         };
+@@ -552,8 +555,27 @@ namespace ps2_stubs
+         constexpr uint32_t kStubMovieWidth = 320u;
+         constexpr uint32_t kStubMovieHeight = 240u;
+         constexpr uint32_t kMpegStrM2V = 0u;
+-        constexpr uint32_t kMpegStrPCM = 1u;
+-        constexpr uint32_t kMpegStrADPCM = 2u;
++        struct MpegStreamDescriptor
++        {
++            uint64_t key;
++            uint64_t mask;
++            unsigned channelShift;
++        };
++        // libmpeg matches the PES stream byte and four private-stream bytes.
++        // Recovered from SCES-52456's table at 0x00141700 and AddStrCallback
++        // at 0x00139e50. The channel is OR'ed into the unmasked key bits.
++        constexpr MpegStreamDescriptor kMpegStreams[] = {
++            {0xe000000000ull, 0xff00000000ull, 32u},
++            {0xbdffc00000ull, 0xffffffffffull, 0u},
++            {0xbdffa00000ull, 0xffffffffffull, 0u},
++            {0xbdffa10000ull, 0xffffffffffull, 0u},
++            {0xbdff900000ull, 0xffffffffffull, 0u},
++            {0xc000000000ull, 0xff00000000ull, 32u},
++            {0xbd80000000ull, 0xffff000000ull, 24u},
++            {0xbda0000000ull, 0xffff000000ull, 24u},
++            {0xbd88000000ull, 0xffff000000ull, 24u},
++            {0xbd90000000ull, 0xffff000000ull, 24u},
++        };
+         constexpr uint8_t kMpegPackHeader = 0xBAu;
+         constexpr uint8_t kMpegSystemHeader = 0xBBu;
+         constexpr uint8_t kMpegProgramEnd = 0xB9u;
+@@ -1131,7 +1153,8 @@ namespace ps2_stubs
+             }
+         }
+ 
+-        std::vector<MpegRegisteredCallback> matchingStreamCallbacks(uint32_t mpegAddr, uint32_t streamType)
++        std::vector<MpegRegisteredCallback> matchingStreamCallbacks(uint32_t mpegAddr, uint32_t streamType,
++                                                                  uint64_t streamKey)
+         {
+             std::vector<MpegRegisteredCallback> out;
+             auto it = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr);
+@@ -1144,7 +1167,13 @@ namespace ps2_stubs
+             {
+                 if (callback.stream && callback.type == streamType)
+                 {
+-                    out.push_back(callback);
++                    const MpegStreamDescriptor &descriptor = kMpegStreams[streamType];
++                    const uint64_t expectedKey = descriptor.key |
++                        (static_cast<uint64_t>(callback.streamId) << descriptor.channelShift);
++                    if ((streamKey & descriptor.mask) == expectedKey)
++                    {
++                        out.push_back(callback);
++                    }
+                 }
+             }
+             return out;
+@@ -1155,6 +1184,7 @@ namespace ps2_stubs
+                                       uint32_t dataAddr,
+                                       uint32_t len,
+                                       std::vector<MpegStreamCallbackEvent> &callbackEvents,
++                                      uint64_t streamKey,
+                                       int64_t pts90k = -1,
+                                       int64_t dts90k = -1)
+         {
+@@ -1165,7 +1195,7 @@ namespace ps2_stubs
+             event.len = len;
+             event.pts = pts90k >= 0 ? static_cast<uint64_t>(pts90k) : 0xFFFFFFFFFFFFFFFFull;
+             event.dts = dts90k >= 0 ? static_cast<uint64_t>(dts90k) : 0xFFFFFFFFFFFFFFFFull;
+-            event.callbacks = matchingStreamCallbacks(mpegAddr, streamType);
++            event.callbacks = matchingStreamCallbacks(mpegAddr, streamType, streamKey);
+             if (!event.callbacks.empty())
+             {
+                 callbackEvents.push_back(std::move(event));
+@@ -1217,6 +1247,7 @@ namespace ps2_stubs
+                 if (streamId == kMpegProgramEnd)
+                 {
+                     playback.streamEnded = true;
++                    playback.inputEnded = true;
+                     playback.cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
+                     flushDecoderIfEnded(playback);
+                     erasePssPrefix(playback, buffer.size());
+@@ -1328,6 +1359,7 @@ namespace ps2_stubs
+                                 playback.pssGuestAddrs[payloadStart],
+                                 static_cast<uint32_t>(packetEnd - payloadStart),
+                                 callbackEvents,
++                                static_cast<uint64_t>(streamId) << 32u,
+                                 pes.pts90k,
+                                 pes.dts90k);
+                         }
+@@ -1345,22 +1377,18 @@ namespace ps2_stubs
+                     const size_t payloadStart = pes.payloadOffset;
+                     if (payloadStart < packetEnd && payloadStart < playback.pssGuestAddrs.size())
+                     {
+-                        queueStreamCallbackEvent(
+-                            mpegAddr,
+-                            kMpegStrPCM,
+-                            playback.pssGuestAddrs[payloadStart],
+-                            static_cast<uint32_t>(packetEnd - payloadStart),
+-                            callbackEvents,
+-                            pes.pts90k,
+-                            pes.dts90k);
+-                        queueStreamCallbackEvent(
+-                            mpegAddr,
+-                            kMpegStrADPCM,
+-                            playback.pssGuestAddrs[payloadStart],
+-                            static_cast<uint32_t>(packetEnd - payloadStart),
+-                            callbackEvents,
+-                            pes.pts90k,
+-                            pes.dts90k);
++                        uint64_t streamKey = static_cast<uint64_t>(streamId) << 32u;
++                        for (size_t i = 0u; i < 4u && payloadStart + i < packetEnd; ++i)
++                        {
++                            streamKey |= static_cast<uint64_t>(buffer[payloadStart + i]) << (24u - i * 8u);
++                        }
++                        for (uint32_t type = 1u; type < std::size(kMpegStreams); ++type)
++                        {
++                            queueStreamCallbackEvent(
++                                mpegAddr, type, playback.pssGuestAddrs[payloadStart],
++                                static_cast<uint32_t>(packetEnd - payloadStart), callbackEvents,
++                                streamKey, pes.pts90k, pes.dts90k);
++                        }
+                     }
+                 }
+ 
+@@ -1373,6 +1401,7 @@ namespace ps2_stubs
+             std::vector<MpegStreamCallbackEvent> ignoredCallbacks;
+             processPssBuffer(mpegAddr, playback, ignoredCallbacks, true);
+             playback.streamEnded = true;
++            playback.inputEnded = true;
+             playback.cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
+             flushDecoderIfEnded(playback);
+         }
+@@ -1757,6 +1786,8 @@ namespace ps2_stubs
+             g_mpeg_stub_state.getPictureWaitTraceCount = 0u;
+             g_mpeg_stub_state.pictureTraceCount = 0u;
+             g_mpeg_stub_state.isEndTraceCount = 0u;
++            g_mpeg_stub_state.ipuMpegAddr = 0u;
++            g_mpeg_stub_state.ipuInputTail.clear();
+             g_mpeg_stub_state.callbacksByMpeg.clear();
+             g_mpeg_stub_state.playbackByMpeg.clear();
+         }
+@@ -1849,6 +1880,39 @@ namespace ps2_stubs
+         }
+     }
+ 
++    void notifyMpegIpuInput(const uint8_t *data, uint32_t byteCount, PS2Runtime *runtime)
++    {
++        if (!data || byteCount == 0u)
++            return;
++        uint32_t completedMpeg = 0u;
++        {
++            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++            // sceCdSt has its own authoritative EOF. Custom producers feed an
++            // elementary sequence_end_code to IPU_TO after the final PSS chunk.
++            if (g_mpeg_stub_state.cdStreamBytesProduced != 0u)
++                return;
++            auto found = g_mpeg_stub_state.playbackByMpeg.find(g_mpeg_stub_state.ipuMpegAddr);
++            if (found == g_mpeg_stub_state.playbackByMpeg.end() || !found->second.sawInput || found->second.inputEnded)
++                return;
++            auto &tail = g_mpeg_stub_state.ipuInputTail;
++            const bool endedInData = containsMpegSequenceEnd(data, byteCount);
++            const uint32_t prefix = std::min(byteCount, 3u);
++            tail.insert(tail.end(), data, data + prefix);
++            const bool endedAcrossTransfers = containsMpegSequenceEnd(tail.data(), tail.size());
++            if (byteCount >= 3u)
++                tail.assign(data + byteCount - 3u, data + byteCount);
++            else if (tail.size() > 3u)
++                tail.erase(tail.begin(), tail.end() - 3);
++            if (endedInData || endedAcrossTransfers)
++            {
++                completedMpeg = found->first;
++                finishPlaybackStream(completedMpeg, found->second);
++            }
++        }
++        if (runtime && completedMpeg != 0u)
++            runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, completedMpeg, KE_OK);
++    }
++
+     void sceMpegFlush(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         (void)rdram;
+@@ -2280,14 +2344,53 @@ namespace ps2_stubs
+         setReturnU32(ctx, getPlaybackState(mpegAddr).decodeMode);
+     }
+ 
+-    void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    static void getMpegPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, bool serviceInput)
+     {
+         const uint32_t mpegAddr = getRegU32(ctx, 4);
+         const uint32_t imageAddr = getRegU32(ctx, 5);
++        MpegRegisteredCallback noDataCallback{};
++        {
++            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++            if (g_mpeg_stub_state.ipuMpegAddr != mpegAddr)
++                g_mpeg_stub_state.ipuInputTail.clear();
++            g_mpeg_stub_state.ipuMpegAddr = mpegAddr;
++            if (serviceInput && runtime->eeScheduler().isExecutingGuest())
++            {
++                const auto callbacks = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr);
++                if (callbacks != g_mpeg_stub_state.callbacksByMpeg.end())
++                    for (const auto &callback : callbacks->second)
++                        if (!callback.stream && callback.type == 1u && callback.func != 0u)
++                        {
++                            noDataCallback = callback;
++                            break;
++                        }
++            }
++        }
++        // The native decoder consumes the ES while demuxing. Keep the game's
++        // input DMA bookkeeping progressing through its normal Nodata callback,
++        // on the calling guest thread, before completing each picture request.
++        if (noDataCallback.func != 0u && runtime->hasFunction(noDataCallback.func))
++        {
++            GuestInvocation invocation{};
++            invocation.kind = GuestInvocationKind::HleCall;
++            invocation.context = *ctx;
++            invocation.context.pc = noDataCallback.func;
++            SET_GPR_U32(&invocation.context, 4, mpegAddr);
++            SET_GPR_U32(&invocation.context, 5, noDataCallback.data);
++            SET_GPR_U32(&invocation.context, 29, 0u);
++            SET_GPR_U32(&invocation.context, 31, 0u);
++            invocation.onComplete = [rdram, runtime](const R5900Context &, R5900Context &parent)
++            {
++                getMpegPicture(rdram, &parent, runtime, false);
++            };
++            runtime->eeScheduler().invokeCurrent(std::move(invocation));
++        }
+         uint32_t width = kStubMovieWidth;
+         uint32_t height = kStubMovieHeight;
+         uint32_t frameCount = 0u;
+         bool haveFrame = false;
++        bool inputDrained = false;
++        uint32_t picturesPending = 0u;
+         MpegDecodedFrame frame;
+         {
+             std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
+@@ -2318,7 +2421,7 @@ namespace ps2_stubs
+                         {
+                             return;
+                         }
+-                        sceMpegGetPicture(rdram, &resumeContext, runtime);
++                        getMpegPicture(rdram, &resumeContext, runtime, false);
+                     });
+             }
+ 
+@@ -2354,7 +2457,7 @@ namespace ps2_stubs
+                             {
+                                 return;
+                             }
+-                            sceMpegGetPicture(rdram, &resumeContext, runtime);
++                            getMpegPicture(rdram, &resumeContext, runtime, false);
+                         });
+                 }
+ 
+@@ -2387,6 +2490,8 @@ namespace ps2_stubs
+                 height = playback.height;
+                 frameCount = playback.picturesServed;
+             }
++            picturesPending = static_cast<uint32_t>(playback.decodedFrames.size());
++            inputDrained = playback.inputEnded && picturesPending == 0u;
+         }
+ 
+         mpegGuestWrite32(rdram, mpegAddr + 0x00u, width);
+@@ -2398,6 +2503,10 @@ namespace ps2_stubs
+             const uint32_t iVar1 = *reinterpret_cast<uint32_t *>(base + 0x40);
+             if (uint8_t *inner = getMemPtr(rdram, iVar1))
+             {
++                // Also support the original libmpeg IsEnd/IsRefBuffEmpty leaf
++                // functions, which directly read the first two sys words.
++                *reinterpret_cast<uint32_t *>(inner + 0x00) = inputDrained ? 1u : 0u;
++                *reinterpret_cast<uint32_t *>(inner + 0x04) = picturesPending;
+                 *reinterpret_cast<uint32_t *>(inner + 0xb0) = 1;
+                 *reinterpret_cast<uint32_t *>(inner + 0xd8) = (getRegU32(ctx, 5) & 0x0FFFFFFFu) | 0x20000000u;
+                 *reinterpret_cast<uint32_t *>(inner + 0xe4) = getRegU32(ctx, 6);
+@@ -2418,6 +2527,11 @@ namespace ps2_stubs
+         setReturnS32(ctx, 0);
+     }
+ 
++    void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        getMpegPicture(rdram, ctx, runtime, true);
++    }
++
+     void sceMpegGetPictureRAW8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         TODO_NAMED("sceMpegGetPictureRAW8", rdram, ctx, runtime);
+@@ -2461,7 +2575,7 @@ namespace ps2_stubs
+         const bool producerEnded =
+             g_mpeg_stub_state.currentCdStreamEofSeen &&
+             playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration;
+-        const bool ended = producerEnded &&
++        const bool ended = (producerEnded || playback.inputEnded) &&
+                            (playback.streamEnded || (playback.decoderFailed && playback.sawInput));
+         const uint64_t presentationEnd = playback.presentationEndTickQ32;
+         const uint64_t currentTickQ32 = runtime != nullptr
+@@ -2511,6 +2625,7 @@ namespace ps2_stubs
+             {
+                 resetState.sawInput = true;
+                 resetState.streamEnded = true;
++                resetState.inputEnded = playback.inputEnded;
+                 resetState.cdStreamGeneration = playback.cdStreamGeneration;
+             }
+             playback = std::move(resetState);
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.h b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.h
+index bbf7edf..a10d103 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.h
+@@ -9,6 +9,7 @@ namespace ps2_stubs
+     void notifyMpegCdStreamStart(PS2Runtime *runtime = nullptr);
+     void notifyMpegCdStreamDataProduced(uint32_t byteCount, bool endOfStream);
+     void notifyMpegCdStreamEof(PS2Runtime *runtime = nullptr);
++    void notifyMpegIpuInput(const uint8_t *data, uint32_t byteCount, PS2Runtime *runtime);
+     void sceMpegFlush(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceMpegAddBs(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceMpegAddCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 9614016..fac3337 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -549,7 +549,7 @@ namespace ps2_syscalls
+         if (heapSize != 0u && heapSize != 0xFFFFFFFFu)
+         {
+             const uint64_t candidate = static_cast<uint64_t>(heapBase) + static_cast<uint64_t>(heapSize);
+-            heapLimit = static_cast<uint32_t>(std::min<uint64_t>(candidate, kDefaultGuestHeapEnd));
++            heapLimit = static_cast<uint32_t>(std::min<uint64_t>(candidate, PS2_RAM_SIZE));
+         }
+ 
+         if (heapLimit <= heapBase)
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+index 5110ee2..c211524 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+@@ -180,9 +180,17 @@ namespace ps2_syscalls
+         setReturnS32(ctx, KE_OK);
+     }
+ 
+-    void InitThread(uint8_t *, R5900Context *ctx, PS2Runtime *)
++    void InitThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        setReturnS32(ctx, EeScheduler::kMainThreadId);
++        // SDK InitThread moves the caller from the kernel's priority 0 to 1.
++        // Native i* services already handle requests directly, so they do not
++        // need the SDK's priority-0 helper, but the caller's priority still
++        // matters: leaving it at 0 starves priority-1 decoding threads.
++        EeScheduler &ee = scheduler(rdram, ctx, runtime);
++        int oldPriority = 0;
++        const int result = ee.changePriority(ee.currentThreadId(), 1, false, oldPriority);
++        setReturnS32(ctx, result == KE_OK ? ee.currentThreadId() : result);
++        ee.transferIfRequested(false);
+     }
+ 
+     void CreateThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 37b6a4d..15e08bb 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -331,6 +331,9 @@ bool PS2Memory::initialize(size_t ramSize)
+     m_path3MaskedFifo.clear();
+     m_vif1PendingPath2ImageQwc = 0u;
+     m_vif1PendingPath2DirectHl = false;
++    m_vif1PendingDirectBytes = 0u;
++    m_vif1PendingDirectHl = false;
++    m_vif1PendingDirectData.clear();
+     resetEeTimers();
+ 
+     try
+@@ -1224,6 +1227,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+ 
+         switch (address)
+         {
++        case 0x10003C00u: // Only FIFO direction is writable in STAT.
++            vif1_regs.stat = (vif1_regs.stat & ~(1u << 23)) | (value & (1u << 23));
++            break;
+         case 0x10003C10u:     // VIF1_FBRST
+             if (value & 0x1u) // RST
+             {
+@@ -1231,6 +1237,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
+                 m_vif1PendingPath2ImageQwc = 0u;
+                 m_vif1PendingPath2DirectHl = false;
++                m_vif1PendingDirectBytes = 0u;
++                m_vif1PendingDirectHl = false;
++                m_vif1PendingDirectData.clear();
+                 m_path3Masked = false;
+                 if (wasPath3Masked)
+                     flushMaskedPath3Packets();
+@@ -1240,6 +1249,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                 vif1_regs.stat &= ~((1u << 8) | (1u << 9) | (1u << 10) | (1u << 11) | (1u << 12) | (1u << 13));
+             }
+             break;
++        case 0x10003C20u:
++            vif1_regs.err = value & 0x7u;
++            break;
+         case 0x10003C30u:
+             vif1_regs.mark = value & 0xFFFFu;
+             vif1_regs.stat &= ~(1u << 6); // clear MRK flag on CPU write
+@@ -1277,6 +1289,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+         case 0x10003CE0u:
+             vif1_regs.top = value & 0x3FFu;
+             break;
++        case 0x10003D00u: case 0x10003D10u: case 0x10003D20u: case 0x10003D30u:
++            vif1_regs.row[(address - 0x10003D00u) / 16u] = value;
++            break;
++        case 0x10003D40u: case 0x10003D50u: case 0x10003D60u: case 0x10003D70u:
++            vif1_regs.col[(address - 0x10003D40u) / 16u] = value;
++            break;
+         default:
+             break;
+         }
+@@ -1311,7 +1329,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                 return true;
+             }
+ 
+-            if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) && (m_gsVRAM || channelBase == 0x10008000u))
++            const bool hostIpuInput = channelBase == 0x1000B400u && m_ipuInputCallback;
++            if (((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) &&
++                 (m_gsVRAM || channelBase == 0x10008000u)) || hostIpuInput)
+             {
+                 auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount)
+                 {
+@@ -1328,6 +1348,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                         m_pendingVif1Transfers.push_back(pt);
+                     else if (channelBase == 0x10008000u)
+                         m_pendingVif0Transfers.push_back(pt);
++                    else if (hostIpuInput)
++                    {
++                        m_pendingIpuTransfers.push_back(pt);
++                        m_ioRegisters[channelBase + 0x10u] = srcAddr + qwCount * 16u;
++                    }
+                 };
+ 
+                 uint32_t chcr = value;
+@@ -1514,7 +1539,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             appendVifTagData(currentTagAddr);
+ 
+                         if (hasPayload)
++                        {
+                             appendData(dataAddr, tagQwc);
++                            if (hostIpuInput)
++                                m_ioRegisters[channelBase + 0x10u] = dataAddr + static_cast<uint32_t>(tagQwc) * 16u;
++                        }
+                         if (irq && tieEnabled)
+                             endChain = true;
+                         if (endChain)
+@@ -1547,6 +1576,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                         {
+                             m_pendingVif0Transfers.push_back(std::move(pt));
+                         }
++                        else if (hostIpuInput)
++                        {
++                            m_pendingIpuTransfers.push_back(std::move(pt));
++                        }
+                     }
+                     // else if (channelBase == 0x10009000u)
+                     // {
+@@ -1662,6 +1695,35 @@ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
+ 
+ void PS2Memory::processPendingTransfers()
+ {
++    const bool hadIpu = !m_pendingIpuTransfers.empty();
++    for (const auto &transfer : m_pendingIpuTransfers)
++    {
++        if (!transfer.chainData.empty())
++        {
++            m_ipuInputCallback(transfer.chainData.data(), static_cast<uint32_t>(transfer.chainData.size()));
++        }
++        else
++        {
++            uint32_t offset = translateAddress(transfer.srcAddr);
++            const uint8_t *source = transfer.fromScratchpad ? m_scratchpad : m_rdram;
++            const uint32_t capacity = transfer.fromScratchpad ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
++            uint32_t remaining = transfer.qwc * 16u;
++            while (remaining != 0u)
++            {
++                offset %= capacity;
++                const uint32_t bytes = std::min(remaining, capacity - offset);
++                m_ipuInputCallback(source + offset, bytes);
++                remaining -= bytes;
++                offset += bytes;
++            }
++        }
++    }
++    m_pendingIpuTransfers.clear();
++    if (hadIpu)
++    {
++        m_ioRegisters[0x1000B420u] = 0u;
++        completeDmacChannel(0x1000B400u, 4u);
++    }
+     const bool hadGif = !m_pendingGifTransfers.empty();
+     uint32_t observedGifQwc = 0u;
+     for (const auto &transfer : m_pendingGifTransfers)
+@@ -2280,6 +2342,34 @@ int PS2Memory::pollDmaRegisters()
+ 
+ uint32_t PS2Memory::readIORegister(uint32_t address)
+ {
++    // DMA VIFcodes update these registers without going through CPU writes.
++    // Return the live state so MARK/CODE/TOP polling observes those updates.
++    if (address >= 0x10003C00u && address < 0x10003E00u)
++    {
++        switch (address - 0x10003C00u)
++        {
++        case 0x00u: return vif1_regs.stat;
++        case 0x20u: return vif1_regs.err;
++        case 0x30u: return vif1_regs.mark;
++        case 0x40u: return vif1_regs.cycle;
++        case 0x50u: return vif1_regs.mode;
++        case 0x60u: return vif1_regs.num;
++        case 0x70u: return vif1_regs.mask;
++        case 0x80u: return vif1_regs.code;
++        case 0x90u: return vif1_regs.itops;
++        case 0xA0u: return vif1_regs.base;
++        case 0xB0u: return vif1_regs.ofst;
++        case 0xC0u: return vif1_regs.tops;
++        case 0xD0u: return vif1_regs.itop;
++        case 0xE0u: return vif1_regs.top;
++        case 0x100u: case 0x110u: case 0x120u: case 0x130u:
++            return vif1_regs.row[(address - 0x10003D00u) / 16u];
++        case 0x140u: case 0x150u: case 0x160u: case 0x170u:
++            return vif1_regs.col[(address - 0x10003D40u) / 16u];
++        default: break;
++        }
++    }
++
+     size_t timerIndex = 0u;
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 8590f14..748df72 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -25,8 +25,9 @@ namespace
+     constexpr uint16_t PAD_L2 = 0x0100u;
+ }
+ 
+-bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
++bool PSPadBackend::readState(int port, int slot, uint8_t *data, size_t size)
+ {
++    if (m_provider) return m_provider(port, slot, data, size);
+     if (!data || size < 32)
+         return false;
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..db442c9 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -573,7 +573,7 @@ ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModule(std::string_view path, con
+ ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
+ {
+     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
+-    return m_iopSubsystem->loadModuleBuffer(guestAddress, arguments, argumentSize);
++    return m_iopSubsystem->loadModuleBuffer(guestAddress, arguments, argumentSize, true);
+ }
+ 
+ bool PS2Runtime::stopIopModule(int32_t moduleId, int32_t *result)
+@@ -668,6 +668,8 @@ bool PS2Runtime::syncCoreSubsystems()
+     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
+                                     { m_gs.processGIFPacket(data, size); });
+     m_memory.setGifArbiter(&m_gifArbiter);
++    m_memory.setIpuInputCallback([this](const uint8_t *data, uint32_t size)
++                               { ps2_stubs::notifyMpegIpuInput(data, size, this); });
+     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
+                                  {
+                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+@@ -728,6 +730,14 @@ bool PS2Runtime::initialize(const char *title)
+             std::cerr << "Failed to bind runtime core subsystems" << std::endl;
+             return false;
+         }
++        if (m_hostCallbacks.initialize)
++        {
++            m_hostCallbacks.initialize(*this, title);
++            InitAudioDevice();
++            m_audioBackend.setAudioReady(IsAudioDeviceReady());
++        }
++        else
++        {
+ #if defined(PLATFORM_VITA)
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
+ #else
+@@ -737,6 +747,7 @@ bool PS2Runtime::initialize(const char *title)
+         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+ #endif
+         SetTargetFPS(60);
++        }
+         if (m_debugUiInitCallback)
+         {
+             m_debugUiInitCallback(*this, m_debugUiUserData);
+@@ -1622,18 +1633,19 @@ uint32_t PS2Runtime::clampGuestHeapBase(uint32_t guestBase) const
+     {
+         normalized &= PS2_RAM_MASK;
+     }
+-    const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+-    return std::min(normalized, hardLimit);
++    // The default leaves room for host-invoked guest callbacks, but an explicit
++    // SetupHeap range may use the last MiB of EE RAM (as Ratchet's CRT does).
++    return std::min(normalized, PS2_RAM_SIZE);
+ }
+ 
+ uint32_t PS2Runtime::clampGuestHeapLimit(uint32_t guestLimit) const
+ {
+     const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
+-    if (guestLimit == 0u || guestLimit > hardLimit)
++    if (guestLimit == 0u)
+     {
+         return hardLimit;
+     }
+-    return guestLimit;
++    return std::min(guestLimit, PS2_RAM_SIZE);
+ }
+ 
+ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
+@@ -1989,6 +2001,12 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
+         return 0u;
+     }
+ 
++    // Games may place their main stack at the very top of RAM. The async
++    // pool grows down from that same address, so skip registered thread
++    // stacks before reserving an invocation frame.
++    const EeKernelSnapshot threads = m_eeScheduler ? m_eeScheduler->snapshot() : EeKernelSnapshot{};
++    const uint32_t heapBase = guestHeapBase();
++    const uint32_t heapLimit = guestHeapLimit();
+     std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
+     uint32_t top = m_asyncCallbackStackTop;
+     if (top > PS2_RAM_SIZE)
+@@ -1997,16 +2015,37 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
+     }
+     top &= ~(kGuestHeapDefaultAlignment - 1u);
+ 
+-    if (top <= allocSize)
+-    {
+-        return 0u;
+-    }
+-
+-    uint32_t base = top - allocSize;
+-    base &= ~(normalizedAlignment - 1u);
+-    if (base < m_asyncCallbackStackFloor || base >= top)
++    uint32_t base = 0u;
++    for (;;)
+     {
+-        return 0u;
++        if (top <= allocSize)
++            return 0u;
++        base = (top - allocSize) & ~(normalizedAlignment - 1u);
++        if (base < m_asyncCallbackStackFloor || base >= top)
++            return 0u;
++        // Explicit heaps can occupy the usual callback pool near the top of
++        // RAM. Keep both allocated and future guest heap blocks untouched.
++        if (heapBase < top && heapLimit > base && heapLimit > heapBase)
++        {
++            top = heapBase & ~(kGuestHeapDefaultAlignment - 1u);
++            continue;
++        }
++        bool overlaps = false;
++        for (const EeThreadSnapshot &thread : threads.threads)
++        {
++            if (thread.stack == 0u || thread.stackSize == 0u)
++                continue;
++            const uint32_t stackBase = thread.stack & 0x1fffffffu;
++            const uint64_t stackEnd = static_cast<uint64_t>(stackBase) + thread.stackSize;
++            if (stackBase < top && stackEnd > base)
++            {
++                top = stackBase & ~(kGuestHeapDefaultAlignment - 1u);
++                overlaps = true;
++                break;
++            }
++        }
++        if (!overlaps)
++            break;
+     }
+ 
+     m_asyncCallbackStackTop = base;
+@@ -2358,9 +2397,12 @@ void PS2Runtime::run()
+     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
+ 
+     // A blank image to use as a framebuffer
+-    Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
+-    Texture2D frameTex = LoadTextureFromImage(blank);
+-    UnloadImage(blank);
++    Texture2D frameTex{};
++    if (!m_hostCallbacks.frame) {
++        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
++        frameTex = LoadTextureFromImage(blank);
++        UnloadImage(blank);
++    }
+ 
+     std::atomic<bool> gameThreadFinished{false};
+ 
+@@ -2386,6 +2428,8 @@ void PS2Runtime::run()
+         gameThreadFinished.store(true, std::memory_order_release); });
+ 
+     uint64_t tick = 0;
++    std::exception_ptr hostFailure;
++    try {
+     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
+     {
+         PS2_IF_AGRESSIVE_LOGS({
+@@ -2420,6 +2464,13 @@ void PS2Runtime::run()
+ 
+             }
+         });
++        if (m_hostCallbacks.frame)
++        {
++            if (!m_hostCallbacks.frame(*this)) requestStop();
++            if (m_debugUiInitialized && m_debugUiDrawCallback)
++                m_debugUiDrawCallback(*this, m_debugUiUserData);
++            continue;
++        }
+         uint32_t presentWidth = FB_WIDTH;
+         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+         UploadFrame(frameTex, this, presentWidth, presentHeight);
+@@ -2453,6 +2504,9 @@ void PS2Runtime::run()
+             break;
+         }
+     }
++    } catch (...) {
++        hostFailure = std::current_exception();
++    }
+ 
+     requestStop();
+     if (gameThread.joinable())
+@@ -2465,8 +2519,12 @@ void PS2Runtime::run()
+         m_debugUiShutdownCallback(*this, m_debugUiUserData);
+         m_debugUiInitialized = false;
+     }
+-    UnloadTexture(frameTex);
+-    CloseWindow();
++    if (m_hostCallbacks.shutdown) m_hostCallbacks.shutdown();
++    else {
++        UnloadTexture(frameTex);
++        CloseWindow();
++    }
+ 
+     RUNTIME_LOG("[run] exiting loop");
++    if (hostFailure) std::rethrow_exception(hostFailure);
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index b02c7ca..738c0a0 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -295,41 +295,57 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
+     processVIF1Data(m_rdram + srcPhys, sizeBytes);
+ }
+ 
++void PS2Memory::processVIF1DirectPayload(const uint8_t *data, uint32_t sizeBytes, bool directHl)
++{
++    uint32_t pos = 0u;
++    if (m_vif1PendingPath2ImageQwc != 0u)
++    {
++        const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, sizeBytes / 16u);
++        std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
++        const uint64_t imageTag = static_cast<uint64_t>(chunkQw & 0x7FFFu) |
++            ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
++            (static_cast<uint64_t>(kGifFmtImage) << 58);
++        std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
++        std::memcpy(imagePacket.data() + 16u, data, static_cast<size_t>(chunkQw) * 16u);
++        submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, directHl);
++        pos = chunkQw * 16u;
++        m_vif1PendingPath2ImageQwc -= chunkQw;
++    }
++    if (pos < sizeBytes)
++    {
++        submitGifPacket(GifPathId::Path2, data + pos, sizeBytes - pos, true, directHl);
++        m_vif1PendingPath2ImageQwc = pendingGifImageQwc(data + pos, sizeBytes - pos);
++    }
++}
++
+ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+ {
+-    if (sizeBytes == 0u)
++    if (!data || sizeBytes == 0u)
+         return;
+ 
+     uint32_t pos = 0;
+ 
+-    while (pos + 4 <= sizeBytes)
++    while (pos < sizeBytes)
+     {
+-        if (m_vif1PendingPath2ImageQwc != 0u)
+-        {
+-            const uint32_t availableQw = (sizeBytes - pos) / 16u;
+-            if (availableQw == 0u)
++        // VIF DIRECT's length and GIF IMAGE's length are independent. A GIF
++        // image can span several DIRECT commands, with VIFcodes between them.
++        // Only bytes inside a DIRECT payload may reach the GIF path.
++        if (m_vif1PendingDirectBytes != 0u)
++        {
++            const uint32_t chunkBytes = std::min(m_vif1PendingDirectBytes, sizeBytes - pos);
++            m_vif1PendingDirectData.insert(m_vif1PendingDirectData.end(), data + pos, data + pos + chunkBytes);
++            pos += chunkBytes;
++            m_vif1PendingDirectBytes -= chunkBytes;
++            if (m_vif1PendingDirectBytes == 0u)
+             {
+-                break;
+-            }
+-
+-            const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
+-            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
+-            const uint64_t imageTag =
+-                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
+-                ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
+-                (static_cast<uint64_t>(kGifFmtImage) << 58);
+-            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
+-            std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
+-            submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
+-
+-            pos += chunkQw * 16u;
+-            m_vif1PendingPath2ImageQwc -= chunkQw;
+-            if (m_vif1PendingPath2ImageQwc == 0u)
+-            {
+-                m_vif1PendingPath2DirectHl = false;
++                processVIF1DirectPayload(m_vif1PendingDirectData.data(),
++                    static_cast<uint32_t>(m_vif1PendingDirectData.size()), m_vif1PendingDirectHl);
++                m_vif1PendingDirectData.clear();
+             }
+             continue;
+         }
++        if (pos + 4u > sizeBytes)
++            break;
+ 
+         uint32_t cmd;
+         memcpy(&cmd, data + pos, 4);
+@@ -487,33 +503,9 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         }
+         else if (opcode == VIF_DIRECT || opcode == VIF_DIRECTHL)
+         {
+-            uint32_t qwCount = imm;
+-            if (qwCount == 0)
+-                qwCount = 65536;
+-            const uint32_t availableQw = (sizeBytes - pos) / 16u;
+-            const bool truncated = qwCount > availableQw;
+-            if (qwCount > availableQw)
+-                qwCount = availableQw;
+-
+-            if (qwCount > 0)
+-            {
+-                const bool directHl = (opcode == VIF_DIRECTHL);
+-                submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
+-
+-                const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
+-                if (pendingImageQw != 0u)
+-                {
+-                    m_vif1PendingPath2ImageQwc = pendingImageQw;
+-                    m_vif1PendingPath2DirectHl = directHl;
+-                }
+-            }
+-
+-            pos += qwCount * 16;
+-            if (truncated)
+-            {
+-                pos = sizeBytes;
+-                break;
+-            }
++            m_vif1PendingDirectBytes = (imm ? static_cast<uint32_t>(imm) : 65536u) * 16u;
++            m_vif1PendingDirectHl = opcode == VIF_DIRECTHL;
++            m_vif1PendingDirectData.clear();
+             continue;
+         }
+         else if ((opcode & 0x60) == 0x60)
+diff --git a/ps2xTest/src/ps2_gs_tests.cpp b/ps2xTest/src/ps2_gs_tests.cpp
+index 0458a8c..b6b7238 100644
+--- a/ps2xTest/src/ps2_gs_tests.cpp
++++ b/ps2xTest/src/ps2_gs_tests.cpp
+@@ -4061,7 +4061,7 @@ void register_ps2_gs_tests()
+                       "TRXDIR payload must encode dir=0 (host-to-local)");
+         });
+ 
+-        tc.Run("sceGsResetGraph frees its temporary GIF packet", [](TestCase &t)
++        tc.Run("sceGsResetGraph programs CRT MMIO without corrupting drawing registers", [](TestCase &t)
+         {
+             PS2Runtime runtime;
+             t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+@@ -4076,8 +4076,14 @@ void register_ps2_gs_tests()
+ 
+             t.Equals(static_cast<int32_t>(getRegU32Test(ctx, 2)), 0,
+                      "sceGsResetGraph should succeed in reset mode");
++            t.Equals(runtime.memory().gs().smode2, uint64_t(3u),
++                     "interlaced frame mode must reach the SMODE2 register");
++            t.Equals(runtime.gs().getDebugSnapshot().ctx[0].alpha, uint64_t(0u),
++                     "SMODE2 must not be sent as the GIF ALPHA_1 register");
++            t.Equals(runtime.gs().getDebugSnapshot().ctx[1].scissor.x1, uint16_t(0u),
++                     "PMODE must not be sent as the GIF SCISSOR_2 register");
+             expectGuestHeapReusable(t, runtime,
+-                                    "sceGsResetGraph should free its temporary GIF packet");
++                                    "sceGsResetGraph should leave the guest heap reusable");
+         });
+ 
+         tc.Run("sceGsSyncV resumes through the scheduler with deterministic field parity", [](TestCase &t)
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index 0b22fe0..9919f96 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -477,6 +477,14 @@ void register_ps2_memory_tests()
+             t.Equals(mem.vif1_regs.col[1], 0xAAAA0002u, "STCOL should set col[1]");
+             t.Equals(mem.vif1_regs.col[2], 0xAAAA0003u, "STCOL should set col[2]");
+             t.Equals(mem.vif1_regs.col[3], 0xAAAA0004u, "STCOL should set col[3]");
++            t.Equals(mem.read32(0x10003C30u), 0x1234u, "CPU polling must see the DMA-written MARK");
++            t.Equals(mem.read32(0x10003C70u), 0x89ABCDEFu, "CPU polling must see the DMA-written MASK");
++            t.Equals(mem.read32(0x10003C80u), makeVifCmd(0x31u, 0u, 0u), "CODE must reflect the last VIFcode");
++            t.Equals(mem.read32(0x10003D20u), 0x33333333u, "CPU reads must see STROW data");
++            t.Equals(mem.read32(0x10003D70u), 0xAAAA0004u, "CPU reads must see STCOL data");
++            mem.write32(0x10003D20u, 0x12345678u);
++            t.Equals(mem.vif1_regs.row[2], 0x12345678u, "CPU row writes must update VIF's unpack state");
++            t.Equals(mem.read32(0x10003D20u), 0x12345678u, "CPU writes and VIFcodes must share register storage");
+         });
+ 
+         tc.Run("VIF UNPACK V4-16 sign and zero extension follow immediate bit14", [](TestCase &t)
+@@ -764,9 +772,11 @@ void register_ps2_memory_tests()
+             t.Equals(mem.vif1_regs.code, irqMarkCmd, "VIF CODE should capture the last processed command");
+             t.IsTrue((mem.vif1_regs.stat & (1u << 11)) != 0u, "irq bit should raise VIF1 STAT.INT");
+             t.Equals(mem.vif1_regs.mark, 0x3456u, "MARK command should still update MARK register");
++            t.IsTrue((mem.read32(0x10003C00u) & (1u << 11)) != 0u, "CPU reads must observe the VIF interrupt flag");
+ 
+             t.IsTrue(mem.writeIORegister(0x10003C10u, 0x8u), "FBRST STC write should succeed");
+             t.IsTrue((mem.vif1_regs.stat & (1u << 11)) == 0u, "FBRST.STC should clear VIF1 STAT.INT");
++            t.IsTrue((mem.read32(0x10003C00u) & (1u << 11)) == 0u, "CPU reads must observe acknowledged VIF interrupts");
+         });
+ 
+         tc.Run("VIF FBRST RST clears VIF1 command state", [](TestCase &t)
+@@ -1912,6 +1922,39 @@ void register_ps2_memory_tests()
+             }
+         });
+ 
++        tc.Run("IPU_TO source chain delivers both REF payloads and advances DMA state", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "memory should initialize");
++            std::vector<uint8_t> received;
++            mem.setIpuInputCallback([&](const uint8_t *data, uint32_t size)
++                                   { received.insert(received.end(), data, data + size); });
++            for (uint32_t i = 0; i < 16u; ++i)
++            {
++                mem.write8(0x4000u + i, static_cast<uint8_t>(i));
++                mem.write8(0x6000u + i, static_cast<uint8_t>(16u + i));
++            }
++            mem.write64(0x2000u, 1ull | (3ull << 28u) | (0x4000ull << 32u));
++            mem.write64(0x2008u, 0u);
++            mem.write64(0x2010u, 1ull | (0x6000ull << 32u));
++            mem.write64(0x2018u, 0u);
++            mem.write32(0x1000B430u, 0x2000u);
++            mem.write32(0x1000B420u, 0u);
++            mem.write32(0x1000B400u, 0x105u);
++            t.Equals(received.size(), size_t{32u}, "both source tags must reach the native IPU sink");
++            bool ordered = received.size() == 32u;
++            for (size_t i = 0; i < received.size(); ++i)
++                ordered = ordered && received[i] == static_cast<uint8_t>(i);
++            t.IsTrue(ordered, "source bytes must arrive once and in tag order");
++            t.Equals(mem.read32(0x1000B410u), 0x6010u, "MADR must pass the final REF payload");
++            t.Equals(mem.read32(0x1000B430u), 0x2020u, "TADR must pass the terminal REFE tag");
++            t.Equals(mem.read32(0x1000B420u), 0u, "completed IPU DMA has no remaining QWC");
++            t.Equals(mem.read32(0x1000B400u) & 0x100u, 0u, "completed IPU DMA clears STR");
++            t.IsTrue((mem.read32(0x1000E010u) & (1u << 4u)) != 0u, "IPU DMA latches channel 4 completion");
++            const auto causes = mem.consumeCompletedDmacCauses();
++            t.IsTrue(causes == std::vector<uint32_t>{4u}, "IPU DMA emits one channel completion");
++        });
++
+         tc.Run("DMAC SPR_FROM copies scratchpad to RDRAM and completes channel 8", [](TestCase &t)
+         {
+             PS2Memory mem;
+@@ -2112,7 +2155,7 @@ void register_ps2_memory_tests()
+             t.IsTrue(imageOk, "VIF1 DIRECT image should update GS VRAM through GIF path2");
+         });
+ 
+-        tc.Run("VIF1 DIRECT image tag can continue with raw image qwords", [](TestCase &t)
++        tc.Run("VIF1 GIF image continues inside a separate DIRECT command", [](TestCase &t)
+         {
+             PS2Memory mem;
+             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+@@ -2141,6 +2184,8 @@ void register_ps2_memory_tests()
+             appendU32(packet, makeVifCmd(0x50u, 0u, 1u)); // DIRECT 1 QW payload: GIF IMAGE tag only.
+             appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
+             appendU64(packet, 0ull);
++            appendU32(packet, makeVifCmd(0x07u, 0u, 0x1234u)); // VIF MARK must not become a pixel.
++            appendU32(packet, makeVifCmd(0x50u, 0u, 1u));
+             for (uint32_t i = 0; i < 16u; ++i)
+             {
+                 packet.push_back(static_cast<uint8_t>(0xA0u + i));
+@@ -2162,7 +2207,8 @@ void register_ps2_memory_tests()
+                     }
+                 }
+             }
+-            t.IsTrue(imageOk, "raw qwords after a DIRECT image tag should continue the PATH2 image upload");
++            t.IsTrue(imageOk, "only the next DIRECT payload should continue the PATH2 image upload");
++            t.Equals(mem.readIORegister(0x10003C30u), 0x1234u, "VIF command between DIRECT blocks must execute");
+         });
+ 
+         tc.Run("VIF1 DIRECT finds an image continuation after packed setup", [](TestCase &t)
+@@ -2194,6 +2240,8 @@ void register_ps2_memory_tests()
+             appendU64(packet, GS_REG_TEXA);
+             appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
+             appendU64(packet, 0ull);
++            appendU32(packet, makeVifCmd(0x00u, 0u, 0u));
++            appendU32(packet, makeVifCmd(0x51u, 0u, 1u));
+             for (uint32_t i = 0; i < 16u; ++i)
+                 packet.push_back(static_cast<uint8_t>(0xC0u + i));
+ 
+@@ -2213,7 +2261,7 @@ void register_ps2_memory_tests()
+                     }
+                 }
+             }
+-            t.IsTrue(imageOk, "raw image continuation after packed setup should not be decoded as VIF/GIF registers");
++            t.IsTrue(imageOk, "DIRECTHL image continuation must exclude VIFcodes after packed setup");
+         });
+ 
+         tc.Run("unaligned accesses throw", [](TestCase &t)
+diff --git a/ps2xTest/src/ps2_runtime_expansion_tests.cpp b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+index 4772f3f..8938b28 100644
+--- a/ps2xTest/src/ps2_runtime_expansion_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_expansion_tests.cpp
+@@ -640,7 +640,7 @@ void register_ps2_runtime_expansion_tests()
+             t.Equals(gMpegStreamCallbackUserData.load(std::memory_order_acquire), kVideoUserData,
+                      "video callback should receive registered user data");
+ 
+-            const std::vector<uint8_t> audioPayload = {0x80u, 0x01u, 0x02u, 0x03u, 0x04u, 0x05u};
++            const std::vector<uint8_t> audioPayload = {0xFFu, 0xA0u, 0x00u, 0x00u, 0x04u, 0x05u};
+             const uint32_t audioPacketSize = writePesPacket(kAudioPacketAddr, 0xBDu, audioPayload);
+ 
+             gMpegStreamCallbackCount.store(0u, std::memory_order_release);
+diff --git a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
+index 4261bfa..91bfbb9 100644
+--- a/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
++++ b/ps2xTest/src/ps2_runtime_interrupt_tests.cpp
+@@ -72,6 +72,9 @@ namespace
+     constexpr uint32_t kInvocationQueuePc = 0x00160530u;
+     constexpr uint32_t kInvocationQueueResumePc = 0x00160540u;
+     constexpr uint32_t kInvocationQueueHandlerPc = 0x00160550u;
++    constexpr uint32_t kInitThreadDriverPc = 0x00160560u;
++    constexpr uint32_t kInitThreadPollPc = 0x00160570u;
++    constexpr uint32_t kInitThreadWorkerPc = 0x00160580u;
+ 
+     constexpr uint32_t kTimer2Count = 0x10001000u;
+     constexpr uint32_t kTimer2Mode = 0x10001010u;
+@@ -97,6 +100,47 @@ namespace
+     uint32_t g_invocationQueueRuns = 0u;
+     uint32_t g_invocationQueueSp = 0u;
+     bool g_invocationQueueSpChanged = false;
++    uint32_t g_initThreadPolls = 0u;
++    int g_initThreadResult = 0;
++
++    void schedulerInitThreadWorker(uint8_t *, R5900Context *ctx, PS2Runtime *)
++    {
++        g_dispatchTrace.push_back(2);
++        ctx->pc = 0u;
++    }
++
++    void schedulerInitThreadDriver(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        g_dispatchTrace.push_back(1);
++        EeThreadCreateParams worker{};
++        worker.entry = kInitThreadWorkerPc;
++        worker.stack = 0x1C000u;
++        worker.stackSize = 0x1000u;
++        worker.priority = 1;
++        auto& ee = runtime->eeScheduler();
++        const int workerId = ee.createThread(worker);
++        ee.startThread(workerId, 0u, *ctx, false);
++        ctx->pc = kInitThreadPollPc;
++        InitThread(rdram, ctx, runtime);
++        g_initThreadResult = static_cast<int32_t>(::getRegU32(ctx, 2));
++    }
++
++    void schedulerInitThreadPoll(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
++    {
++        if (g_dispatchTrace.size() > 1u)
++        {
++            g_dispatchTrace.push_back(3);
++            ctx->pc = 0u;
++            runtime->requestStop();
++        }
++        else if (++g_initThreadPolls >= 16384u)
++        {
++            // Bound the failing case: a priority-0 caller otherwise starves
++            // the priority-1 worker forever while repeatedly polling it.
++            ctx->pc = 0u;
++            runtime->requestStop();
++        }
++    }
+ 
+     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
+     {
+@@ -209,6 +253,8 @@ namespace
+     void schedulerIrqStackWait(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         EeScheduler &scheduler = runtime->eeScheduler();
++        if (getRegU32(ctx, 29) >= PS2_RAM_SIZE - 0x4000u)
++            scheduler.setupCurrentThread(PS2_RAM_SIZE - 0x4000u, 0x4000u, 0u);
+         scheduler.addIrqHandler(false,
+                                 2u,
+                                 kIrqStackHandlerPc,
+@@ -379,6 +425,27 @@ void register_ps2_runtime_interrupt_tests()
+ {
+     MiniTest::Case("PS2RuntimeInterrupt", [](TestCase &tc)
+     {
++        tc.Run("SDK InitThread lets a priority-1 worker run while the caller polls", [](TestCase &t)
++        {
++            TestEnv env;
++            env.runtime.registerFunction(kInitThreadDriverPc, schedulerInitThreadDriver);
++            env.runtime.registerFunction(kInitThreadPollPc, schedulerInitThreadPoll);
++            env.runtime.registerFunction(kInitThreadWorkerPc, schedulerInitThreadWorker);
++            g_dispatchTrace.clear();
++            g_initThreadPolls = 0u;
++            g_initThreadResult = -1;
++            R5900Context mainContext{};
++            mainContext.pc = kInitThreadDriverPc;
++            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
++            env.runtime.eeScheduler().run();
++            t.IsTrue(g_dispatchTrace == std::vector<int>({1, 2, 3}),
++                     "the initialized caller must allow its decoding worker to finish");
++            t.Equals(g_initThreadResult, EeScheduler::kMainThreadId,
++                     "native InitThread must return an existing thread handle");
++            const auto* main = env.runtime.eeScheduler().thread(EeScheduler::kMainThreadId);
++            t.Equals(main->currentPriority, 1, "SDK initialization must release reserved priority zero");
++        });
++
+         tc.Run("negative interrupt-safe EE syscall ids dispatch", [](TestCase &t)
+         {
+             TestEnv env;
+@@ -572,6 +639,30 @@ void register_ps2_runtime_interrupt_tests()
+                      "IRQ handler stack writes must not clobber the registering thread's live frame");
+         });
+ 
++        tc.Run("IRQ stack does not overlap a main thread stack at the top of RAM", [](TestCase &t)
++        {
++            TestEnv env;
++            env.runtime.registerFunction(kIrqStackWaitPc, schedulerIrqStackWait);
++            env.runtime.registerFunction(kIrqStackResumePc, schedulerIrqStackResume);
++            env.runtime.registerFunction(kIrqStackHandlerPc, schedulerIrqStackHandler);
++            constexpr uint32_t stackBase = PS2_RAM_SIZE - 0x4000u;
++            constexpr uint32_t stackTop = PS2_RAM_SIZE - 16u;
++            constexpr uint32_t guardAddress = stackTop - 8u;
++            constexpr uint64_t guard = 0x1122334455667788ull;
++            std::memcpy(env.rdram.data() + guardAddress, &guard, sizeof(guard));
++            g_irqObservedSp = 0u;
++            R5900Context mainContext{};
++            mainContext.pc = kIrqStackWaitPc;
++            setRegU32(mainContext, 29, stackTop);
++            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
++            env.runtime.eeScheduler().run();
++            uint64_t guardAfter = 0u;
++            std::memcpy(&guardAfter, env.rdram.data() + guardAddress, sizeof(guardAfter));
++            t.IsTrue(g_irqObservedSp != 0u && g_irqObservedSp < stackBase,
++                     "the interrupt stack must lie below the main thread's registered stack");
++            t.Equals(guardAfter, guard, "the interrupt must preserve the main thread's live stack words");
++        });
++
+         tc.Run("pending async callbacks execute sequentially on a reusable invocation stack", [](TestCase &t)
+         {
+             TestEnv env;

@@ -1,0 +1,27 @@
+{
+  "description": "SCES-52456 callback entries recovered from the original boot ELF. These retain the guest instructions; they are not runtime stubs.",
+  "groups": [
+    {
+      "source": "State callback table at 0x003322F8, used by JALR at 0x0039B290 (35 entries)",
+      "addresses": [
+        "0x0039B2D0", "0x0039B2F0", "0x0039B418", "0x0039B468",
+        "0x0039B490", "0x0039B4B8", "0x0039B4E0", "0x0039B548",
+        "0x0039B598", "0x0039B628", "0x0039B658", "0x0039B6B8",
+        "0x0039B708", "0x0039B760", "0x0039B950", "0x0039B990",
+        "0x0039BA00", "0x0039BA60", "0x0039BBF8", "0x0039BCB0",
+        "0x0039BCD8", "0x0039BD20", "0x0039BD48", "0x0039BD90",
+        "0x0039BDF0", "0x0039BE18", "0x0039BF40", "0x0039BF98",
+        "0x0039BEB8", "0x0039BAC8", "0x0039BB88", "0x0039B7F8",
+        "0x0039B850", "0x0039BFF0", "0x0039B1B8"
+      ]
+    },
+    {
+      "source": "Conditional callback at record 0x00332F88+0x0C, called by JALR at 0x0039F7F4",
+      "addresses": ["0x0039F9B8"]
+    },
+    {
+      "source": "Menu condition/action pointers at original data addresses 0x0033290C, 0x00332ABC, 0x0033369C, 0x0033384C, 0x003338C4; action JALR at 0x0039F65C",
+      "addresses": ["0x0039F908", "0x0039F920", "0x0039FAB8", "0x0039FAE0", "0x0039FAF8"]
+    }
+  ]
+}

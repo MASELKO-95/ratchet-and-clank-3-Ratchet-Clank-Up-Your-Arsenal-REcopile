@@ -1,0 +1,16 @@
+Ratchet & Clank 3 - RE:COPILE Edition
+Copyright (C) 2026 MASELKO-95 for original project work
+SPDX-License-Identifier: GPL-3.0-only
+Source: https://github.com/MASELKO-95/ratchet-recopile-edition
+
+2026-10-15 - MASELKO-95: prepared a source-only experimental Linux edition,
+added direct RE:COPILE entry points, dependency/publication checks and build
+instructions; updated the runtime window title to RE:COPILE Edition.
+Adopted GNU GPLv3 for original work, replacing the earlier custom license draft.
+No full-gameplay or Windows qualification is claimed.
+
+PS2Recomp and its runtime patches retain GNU GPLv3 terms and authorship;
+see LICENSES/PS2Recomp-GPL-3.0.md. The Wrench decompressor integration retains
+GPL-3.0-or-later; see LICENSES/Wrench-GPL-3.0.txt. Dependency authors, exact
+revisions and terms are listed in THIRD_PARTY.md. Their notices remain intact.
+This license grants no rights to proprietary game data, ISO, BIOS or saves.
